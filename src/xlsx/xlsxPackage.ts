@@ -1,5 +1,6 @@
-import JSZip from "jszip";
+import type JSZip from "jszip";
 
+import { loadOoxmlZip } from "../ooxml/jszipReader";
 import { enforceOoxmlPackagePolicy } from "../ooxml/packagePolicy";
 import {
   DEFAULT_XLSX_ZIP_LIMITS,
@@ -122,10 +123,7 @@ export class XlsxPackage {
 
     let zip: JSZip;
     try {
-      zip = await JSZip.loadAsync(buffer, {
-        createFolders: false,
-        checkCRC32: false,
-      });
+      zip = await loadOoxmlZip(buffer);
     } catch (error) {
       throw new XlsxPackageError(
         "damaged",

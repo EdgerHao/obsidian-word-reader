@@ -217,6 +217,34 @@ XML retention from the large-workbook path:
   `benchmarks/OBSIDIAN_DESKTOP_BASELINE.md`, including activation, long tasks,
   actual DOM, and resources remaining after close.
 
+## 3.4.0 Lifecycle and Recovery Scope
+
+- `npm run lifecycle:check` runs DOCX, PPTX, XLSX, and mixed sequences, each
+  with at least 100 open, forced-reload, fast-navigation, file-switch, and close
+  cycles, inside a dedicated Node.js process with forced garbage collection.
+- Every cycle exercises and returns Blob URLs, format caches, background tasks,
+  timeout/animation work, observers, and document listeners to zero. The gate
+  rejects a 20-sample monotonic retained-heap run or more than 16 MiB median
+  retained-heap growth after warmup.
+- Parse, search, thumbnail, worksheet, and drawing generations must not commit
+  after cancellation. Task failures are centrally handled and the process
+  records zero unhandled Promise rejections.
+- Vault modify/delete/rename events invalidate both the in-flight file revision
+  and persisted position/navigation state. Numeric mtime/size checks plus a
+  vault-event generation catch replacements that preserve file statistics.
+- Restored missing files and format-changed leaves show a recoverable state;
+  valid duplicate views stay independent. A failure in one leaf or saved
+  workspace entry cannot stop other reader views or plugin startup.
+- Settings recovery migrates valid fields independently, drops unknown or
+  partially written values, and does not write fallback data when raw loading
+  itself fails. Save failures are logged without rejecting view unload.
+- A repeated 300-attempt matrix covers damaged, encrypted, compression-limit,
+  and unsupported packages across all three formats and requires zero tracked
+  residue. Result, trend, and summary artifacts are retained by CI for 90 days.
+- Production uses the pinned JSZip read path through a minimal host. Archive
+  generation remains unavailable to the plugin, and full parser/security tests
+  protect the compatibility boundary while keeping `main.js <= 500 KiB`.
+
 ## Manual Test Checklist
 
 Run this checklist before publishing a stable release:
@@ -226,6 +254,8 @@ Run this checklist before publishing a stable release:
   - `npm test`
   - `npm run build`
   - `npm run performance:check`
+  - `npm run lifecycle:check`
+  - `npm run zip-reader:check`
   - `npm run dependencies:audit`
   - `npm run security:scan`
   - `npm run release`

@@ -31,6 +31,10 @@ import {
 } from "./pptxRenderer";
 import { PptxTaskQueue } from "./pptxTaskQueue";
 import { ReaderLifecycle } from "../reader/lifecycle";
+import {
+  type ReaderFileChange,
+  type ReaderFileRevision,
+} from "../reader/fileRevision";
 import { formatReaderDiagnosticReport } from "../reader/diagnostics";
 import {
   createReaderPerformanceDiagnosticReport,
@@ -47,7 +51,13 @@ import {
 } from "../reader/status";
 import { normalizeZoom, preserveZoomAnchor } from "../reader/zoom";
 import type { ReaderSession } from "../reader/session";
+import {
+  getReaderRecoveryText,
+  type ReaderRecoveryReason,
+} from "../reader/recovery";
+import { ReaderResourceScope } from "../reader/resourceScope";
 import { OfficeReaderShell } from "../reader/shell";
+import type { ReaderWorkspaceRecoveryReason } from "../reader/workspaceRecovery";
 import type { ReaderCapability } from "../reader/capabilities";
 import {
   PPTX_ADAPTER,
@@ -141,6 +151,10 @@ export class PptxSession extends FileView implements ReaderSession {
   private currentRenderDiagnostics: PptxRenderDiagnostics | null = null;
   private lastErrorDiagnostics: string | null = null;
   private readonly performanceTracker = new ReaderPerformanceTracker();
+  private readonly sessionResources = new ReaderResourceScope((error) => {
+    console.error("Office Reader PPTX lifecycle task failed", error);
+  });
+  private fileRevision: ReaderFileRevision | null = null;
   private performanceLoadStartedAt: number | null = null;
   private firstReadableRecorded = false;
   private maximumDomNodes = 0;
@@ -148,6 +162,7 @@ export class PptxSession extends FileView implements ReaderSession {
   private readonly slideLifecycle = new ReaderLifecycle();
   private readonly thumbnailLifecycle = new ReaderLifecycle();
   private readonly slideResources = new RetainedResourceRegistry((resource) => {
+    this.sessionResources.forget("blobUrls", resource);
     URL.revokeObjectURL(resource);
   });
   private readonly readerStatus = new ReaderStatusController((status) => {
@@ -186,7 +201,8 @@ export class PptxSession extends FileView implements ReaderSession {
 
   async onOpen(): Promise<void> {
     this.buildLayout();
-    this.contentEl.doc.addEventListener(
+    this.sessionResources.listen(
+      this.contentEl.doc,
       "fullscreenchange",
       this.handleFullscreenChange,
     );
@@ -195,22 +211,21 @@ export class PptxSession extends FileView implements ReaderSession {
         this.applyScale();
       }
     });
-    resizeObserver.observe(this.contentEl);
+    this.sessionResources.observe(resizeObserver, this.contentEl);
     this.resizeObserver = resizeObserver;
   }
 
   async onClose(): Promise<void> {
-    this.contentEl.doc.removeEventListener(
-      "fullscreenchange",
-      this.handleFullscreenChange,
-    );
-    this.resizeObserver?.disconnect();
+    this.sessionResources.clear();
     this.resizeObserver = null;
     this.loadLifecycle.cancel();
     this.slideLifecycle.cancel();
     this.thumbnailLifecycle.cancel();
     this.releasePresentation();
     this.clearCanvas();
+    this.fileRevision = null;
+    await this.sessionResources.drainTasks();
+    this.sessionResources.clear();
   }
 
   async onLoadFile(file: TFile): Promise<void> {
@@ -224,18 +239,22 @@ export class PptxSession extends FileView implements ReaderSession {
 
   async onUnloadFile(): Promise<void> {
     this.saveReadingState();
-    await this.plugin.flushData();
     this.activeFilePath = null;
     this.loadLifecycle.cancel();
     this.slideLifecycle.cancel();
     this.thumbnailLifecycle.cancel();
     this.releasePresentation();
     this.clearCanvas();
+    this.fileRevision = null;
     this.setStatus("");
+    await this.plugin.flushData();
   }
 
   async reload(): Promise<void> {
     if (this.file) {
+      if (!this.activeFilePath) {
+        this.restoreReadingState(this.file);
+      }
       await this.loadPresentation(this.file);
     }
   }
@@ -256,6 +275,25 @@ export class PptxSession extends FileView implements ReaderSession {
 
   async previousSlide(): Promise<void> {
     await this.goToSlide(this.currentSlideIndex - 1);
+  }
+
+  handleFileChange(change: ReaderFileChange): void {
+    if (
+      change.path !== this.activeFilePath &&
+      change.path !== this.file?.path
+    ) {
+      return;
+    }
+    const reason = change.kind === "renamed" &&
+      change.newExtension &&
+      !this.adapter.supports({ extension: change.newExtension })
+      ? "format-changed"
+      : change.kind;
+    this.invalidateForRecovery(reason);
+  }
+
+  handleWorkspaceRecovery(reason: ReaderWorkspaceRecoveryReason): void {
+    this.invalidateForRecovery(reason);
   }
 
   async previousPage(): Promise<void> {
@@ -407,7 +445,9 @@ export class PptxSession extends FileView implements ReaderSession {
       this.thumbnailLifecycle.begin();
       this.buildNavigationList();
       this.updateNotes();
-      void this.renderCurrentSlide({ restoreScroll: true });
+      this.sessionResources.runTask(() =>
+        this.renderCurrentSlide({ restoreScroll: true })
+      );
       this.refreshThumbnailQueue();
     }
   }
@@ -435,7 +475,7 @@ export class PptxSession extends FileView implements ReaderSession {
       "refresh-cw",
       text.toolbar.reload,
       () => {
-        void this.reload();
+        this.sessionResources.runTask(() => this.reload());
       },
     );
     this.navigationButtonEl = this.createToolbarButton(
@@ -455,7 +495,7 @@ export class PptxSession extends FileView implements ReaderSession {
       "chevron-left",
       text.toolbar.previousSlide,
       () => {
-        void this.previousSlide();
+        this.sessionResources.runTask(() => this.previousSlide());
       },
     );
     this.nextButtonEl = this.createToolbarButton(
@@ -464,7 +504,7 @@ export class PptxSession extends FileView implements ReaderSession {
       "chevron-right",
       text.toolbar.nextSlide,
       () => {
-        void this.nextSlide();
+        this.sessionResources.runTask(() => this.nextSlide());
       },
     );
 
@@ -485,7 +525,7 @@ export class PptxSession extends FileView implements ReaderSession {
       this.pageInputEl.addEventListener("change", () => {
         const page = Number(this.pageInputEl?.value);
         if (Number.isInteger(page)) {
-          void this.goToSlide(page - 1);
+          this.sessionResources.runTask(() => this.goToSlide(page - 1));
         } else {
           this.updateNavigationControls();
         }
@@ -535,7 +575,7 @@ export class PptxSession extends FileView implements ReaderSession {
       "copy",
       text.toolbar.copyText,
       () => {
-        void this.copyText();
+        this.sessionResources.runTask(() => this.copyText());
       },
     );
     this.createToolbarButton(
@@ -544,7 +584,7 @@ export class PptxSession extends FileView implements ReaderSession {
       "activity",
       text.toolbar.copyRenderDiagnostics,
       () => {
-        void this.copyRenderDiagnostics();
+        this.sessionResources.runTask(() => this.copyRenderDiagnostics());
       },
     );
     this.createToolbarButton(
@@ -553,7 +593,7 @@ export class PptxSession extends FileView implements ReaderSession {
       "notebook-pen",
       text.toolbar.createSummaryNote,
       () => {
-        void this.createSummaryNote();
+        this.sessionResources.runTask(() => this.createSummaryNote());
       },
     );
     this.notesButtonEl = this.createToolbarButton(
@@ -571,7 +611,7 @@ export class PptxSession extends FileView implements ReaderSession {
       "fullscreen",
       text.toolbar.enterFullscreen,
       () => {
-        void this.toggleFullscreen();
+        this.sessionResources.runTask(() => this.toggleFullscreen());
       },
     );
     this.createToolbarButton(
@@ -580,7 +620,7 @@ export class PptxSession extends FileView implements ReaderSession {
       "external-link",
       text.toolbar.openExternally,
       () => {
-        void this.openExternal();
+        this.sessionResources.runTask(() => this.openExternal());
       },
     );
 
@@ -616,7 +656,9 @@ export class PptxSession extends FileView implements ReaderSession {
           )[0];
           if (firstResult) {
             event.preventDefault();
-            void this.goToSlide(firstResult.slideIndex);
+            this.sessionResources.runTask(() =>
+              this.goToSlide(firstResult.slideIndex)
+            );
           }
         }
       });
@@ -701,24 +743,28 @@ export class PptxSession extends FileView implements ReaderSession {
       case "ArrowLeft":
       case "PageUp":
         event.preventDefault();
-        void this.previousSlide();
+        this.sessionResources.runTask(() => this.previousSlide());
         break;
       case "ArrowRight":
       case "PageDown":
         event.preventDefault();
-        void this.nextSlide();
+        this.sessionResources.runTask(() => this.nextSlide());
         break;
       case " ":
         event.preventDefault();
-        void (event.shiftKey ? this.previousSlide() : this.nextSlide());
+        this.sessionResources.runTask(() =>
+          event.shiftKey ? this.previousSlide() : this.nextSlide()
+        );
         break;
       case "Home":
         event.preventDefault();
-        void this.goToSlide(0);
+        this.sessionResources.runTask(() => this.goToSlide(0));
         break;
       case "End":
         event.preventDefault();
-        void this.goToSlide((this.presentation?.slideCount ?? 1) - 1);
+        this.sessionResources.runTask(() =>
+          this.goToSlide((this.presentation?.slideCount ?? 1) - 1)
+        );
         break;
     }
   }
@@ -730,6 +776,10 @@ export class PptxSession extends FileView implements ReaderSession {
     this.firstReadableRecorded = false;
     this.maximumDomNodes = 0;
     const token = this.loadLifecycle.begin();
+    this.fileRevision = this.plugin.captureFileRevision(
+      file,
+      this.adapter.format,
+    );
     if (previousToken > 0) {
       this.performanceTracker.recordCancellation(
         !this.loadLifecycle.isCurrent(previousToken),
@@ -749,12 +799,15 @@ export class PptxSession extends FileView implements ReaderSession {
         "packageLoadMs",
         performance.now() - packageLoadStartedAt,
       );
-      if (!this.loadLifecycle.isCurrent(token)) {
+      if (!this.isLoadCurrent(token)) {
         presentation.clearCaches();
         this.performanceTracker.recordCancellation(true);
         return;
       }
       this.presentation = presentation;
+      this.sessionResources.track("caches", presentation, () => {
+        presentation.clearCaches();
+      });
       this.currentSlideIndex = clamp(
         this.currentSlideIndex,
         0,
@@ -774,7 +827,7 @@ export class PptxSession extends FileView implements ReaderSession {
         concurrency: 4,
         priorityIndex: this.currentSlideIndex,
         isCancelled: () =>
-          !this.loadLifecycle.isCurrent(token) ||
+          !this.isLoadCurrent(token) ||
           this.presentation !== presentation,
         onMetadata: (metadata) => {
           this.slideMetadata[metadata.index] = metadata;
@@ -783,10 +836,12 @@ export class PptxSession extends FileView implements ReaderSession {
           this.scheduleMetadataUiRefresh();
         },
       });
-      void this.metadataPromise.then(
-        () => {
+      const metadataPromise = this.metadataPromise;
+      this.sessionResources.runTask(async () => {
+        try {
+          await metadataPromise;
           if (
-            this.loadLifecycle.isCurrent(token) &&
+            this.isLoadCurrent(token) &&
             this.presentation === presentation
           ) {
             this.performanceTracker.recordTiming(
@@ -794,31 +849,32 @@ export class PptxSession extends FileView implements ReaderSession {
               performance.now() - metadataStartedAt,
             );
           }
-        },
-        () => undefined,
-      );
-      void this.metadataPromise.catch((error: unknown) => {
-        if (
-          error instanceof Error &&
-          error.name === "PptxMetadataCancelledError"
-        ) {
-          this.performanceTracker.recordCancellation(true);
-        }
-        if (
-          this.loadLifecycle.isCurrent(token) &&
-          this.presentation === presentation &&
-          error instanceof Error &&
-          error.name !== "PptxMetadataCancelledError" &&
-          typeof __DEV__ !== "undefined" &&
-          __DEV__
-        ) {
-          console.debug("[Office Reader] PPTX metadata indexing stopped", error);
+        } catch (error) {
+          if (
+            error instanceof Error &&
+            error.name === "PptxMetadataCancelledError"
+          ) {
+            this.performanceTracker.recordCancellation(true);
+          }
+          if (
+            this.isLoadCurrent(token) &&
+            this.presentation === presentation &&
+            error instanceof Error &&
+            error.name !== "PptxMetadataCancelledError" &&
+            typeof __DEV__ !== "undefined" &&
+            __DEV__
+          ) {
+            console.debug(
+              "[Office Reader] PPTX metadata indexing stopped",
+              error,
+            );
+          }
         }
       });
       await this.renderCurrentSlide({ restoreScroll: true });
       this.refreshThumbnailQueue();
     } catch (error) {
-      if (!this.loadLifecycle.isCurrent(token)) {
+      if (!this.isLoadCurrent(token)) {
         return;
       }
       this.releasePresentation();
@@ -843,7 +899,7 @@ export class PptxSession extends FileView implements ReaderSession {
     this.pendingScrollPosition = { left: 0, top: 0 };
     this.updateNavigationControls();
     this.saveReadingState();
-    void this.loadMetadataForSlide(nextIndex);
+    this.sessionResources.runTask(() => this.loadMetadataForSlide(nextIndex));
     await this.renderCurrentSlide({ restoreScroll: true });
     this.performanceTracker.recordTiming(
       "navigationMs",
@@ -899,6 +955,11 @@ export class PptxSession extends FileView implements ReaderSession {
         return;
       }
 
+      for (const resource of resources) {
+        this.sessionResources.track("blobUrls", resource, () => {
+          URL.revokeObjectURL(resource);
+        });
+      }
       this.slideResources.replace(resources);
       adoptedResources = true;
       this.stageEl = rendered.element;
@@ -974,9 +1035,9 @@ export class PptxSession extends FileView implements ReaderSession {
 
   private scheduleNavigationSearch(): void {
     if (this.searchTimer !== null) {
-      window.clearTimeout(this.searchTimer);
+      this.sessionResources.clearTimer(window, this.searchTimer);
     }
-    this.searchTimer = window.setTimeout(() => {
+    this.searchTimer = this.sessionResources.setTimer(window, () => {
       this.searchTimer = null;
       this.applyNavigationSearch();
     }, PPTX_SEARCH_DEBOUNCE_MS);
@@ -1019,14 +1080,17 @@ export class PptxSession extends FileView implements ReaderSession {
       return;
     }
     const renderWindow = this.slideListEl.win;
-    this.navigationRenderFrameId = renderWindow.requestAnimationFrame(() => {
+    this.navigationRenderFrameId = this.sessionResources.requestFrame(
+      renderWindow,
+      () => {
       this.navigationRenderFrameId = null;
       const startedAt = performance.now();
       this.renderNavigationWindow();
       this.performanceTracker.recordScrollFrame(
         performance.now() - startedAt,
       );
-    });
+      },
+    );
   }
 
   private renderNavigationWindow(): void {
@@ -1080,7 +1144,7 @@ export class PptxSession extends FileView implements ReaderSession {
     entryEl.className = "pptx-reader-slide-entry";
     entryEl.type = "button";
     entryEl.addEventListener("click", () => {
-      void this.goToSlide(index);
+      this.sessionResources.runTask(() => this.goToSlide(index));
     });
     const thumbnailEl = entryEl.createDiv({
       cls: "pptx-reader-thumbnail",
@@ -1234,6 +1298,11 @@ export class PptxSession extends FileView implements ReaderSession {
       if (isCancelled()) {
         return;
       }
+      for (const resource of resources) {
+        this.sessionResources.track("blobUrls", resource, () => {
+          URL.revokeObjectURL(resource);
+        });
+      }
       entry.resources = resources;
       adopted = true;
       entry.rendered = true;
@@ -1263,7 +1332,7 @@ export class PptxSession extends FileView implements ReaderSession {
         this.thumbnailLifecycle.isCurrent(lifecycleToken) &&
         this.presentation === presentation
       ) {
-        entry.thumbnailEl.win.setTimeout(() => {
+        this.sessionResources.setTimer(entry.thumbnailEl.win, () => {
           this.refreshThumbnailQueue();
         }, 0);
       }
@@ -1281,6 +1350,7 @@ export class PptxSession extends FileView implements ReaderSession {
     entry.rendering = false;
     entry.rendered = false;
     releaseResources(entry.resources, (resource) => {
+      this.sessionResources.forget("blobUrls", resource);
       URL.revokeObjectURL(resource);
     });
     entry.resources.clear();
@@ -1318,7 +1388,7 @@ export class PptxSession extends FileView implements ReaderSession {
       return;
     }
     const renderWindow = this.contentEl.win;
-    this.metadataUiFrameId = renderWindow.requestAnimationFrame(() => {
+    this.metadataUiFrameId = this.sessionResources.requestFrame(renderWindow, () => {
       this.metadataUiFrameId = null;
       this.applyNavigationSearch(false);
       this.updateNotes();
@@ -1628,7 +1698,7 @@ export class PptxSession extends FileView implements ReaderSession {
       "clipboard-copy",
       this.text.toolbar.copyRenderDiagnostics,
       () => {
-        void this.copyDiagnostics();
+        this.sessionResources.runTask(() => this.copyDiagnostics());
       },
     );
     this.createIconButton(
@@ -1636,7 +1706,7 @@ export class PptxSession extends FileView implements ReaderSession {
       "refresh-cw",
       this.text.toolbar.reload,
       () => {
-        void this.reload();
+        this.sessionResources.runTask(() => this.reload());
       },
     );
     this.createIconButton(
@@ -1644,10 +1714,50 @@ export class PptxSession extends FileView implements ReaderSession {
       "external-link",
       this.text.toolbar.openExternally,
       () => {
-        void this.openExternal();
+        this.sessionResources.runTask(() => this.openExternal());
       },
     );
     this.setStatus(info.title, true);
+  }
+
+  private invalidateForRecovery(reason: ReaderRecoveryReason): void {
+    this.activeFilePath = null;
+    this.pendingScrollPosition = null;
+    this.fileRevision = null;
+    this.loadLifecycle.cancel();
+    this.slideLifecycle.cancel();
+    this.thumbnailLifecycle.cancel();
+    this.releasePresentation();
+    this.clearCanvas();
+    this.lastErrorDiagnostics = null;
+    if (!this.canvasEl) {
+      this.buildLayout();
+    }
+    if (!this.canvasEl) {
+      return;
+    }
+    const recovery = getReaderRecoveryText(
+      this.plugin.settings.common.language,
+      reason,
+    );
+    const messageEl = this.shell.renderRecoveryError(
+      this.canvasEl,
+      recovery,
+      () => {
+        this.sessionResources.runTask(() => this.reload());
+      },
+    );
+    messageEl.addClass("pptx-reader-error");
+    this.setStatus(recovery.status, true);
+  }
+
+  private isLoadCurrent(token: number): boolean {
+    return this.loadLifecycle.isCurrent(token) &&
+      this.plugin.isFileRevisionCurrent(
+        this.fileRevision,
+        this.file,
+        this.adapter.format,
+      );
   }
 
   private setStatus(
@@ -1729,7 +1839,10 @@ export class PptxSession extends FileView implements ReaderSession {
     this.thumbnailQueue.clear();
     this.cancelNavigationWork();
     this.releaseThumbnailResources();
-    this.presentation?.clearCaches();
+    if (this.presentation) {
+      this.sessionResources.forget("caches", this.presentation);
+      this.presentation.clearCaches();
+    }
     this.presentation = null;
     this.metadataPromise = null;
     this.slideMetadata = [];
@@ -1756,15 +1869,21 @@ export class PptxSession extends FileView implements ReaderSession {
 
   private cancelNavigationWork(): void {
     if (this.searchTimer !== null) {
-      window.clearTimeout(this.searchTimer);
+      this.sessionResources.clearTimer(window, this.searchTimer);
       this.searchTimer = null;
     }
     if (this.navigationRenderFrameId !== null) {
-      this.contentEl.win.cancelAnimationFrame(this.navigationRenderFrameId);
+      this.sessionResources.cancelFrame(
+        this.contentEl.win,
+        this.navigationRenderFrameId,
+      );
       this.navigationRenderFrameId = null;
     }
     if (this.metadataUiFrameId !== null) {
-      this.contentEl.win.cancelAnimationFrame(this.metadataUiFrameId);
+      this.sessionResources.cancelFrame(
+        this.contentEl.win,
+        this.metadataUiFrameId,
+      );
       this.metadataUiFrameId = null;
     }
   }

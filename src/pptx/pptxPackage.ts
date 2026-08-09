@@ -1,4 +1,4 @@
-import JSZip from "jszip";
+import type JSZip from "jszip";
 
 import {
   attribute,
@@ -17,6 +17,7 @@ import {
   enforceOoxmlPackagePolicy,
   OoxmlPolicyError,
 } from "../ooxml/packagePolicy";
+import { loadOoxmlZip } from "../ooxml/jszipReader";
 import {
   extractSlideMetadata,
   type PptxSlideMetadata,
@@ -167,10 +168,7 @@ export class PptxPackage {
     const zipSummary = validateZipSafety(buffer, limits);
     let zip: JSZip;
     try {
-      zip = await JSZip.loadAsync(buffer, {
-        createFolders: false,
-        checkCRC32: false,
-      });
+      zip = await loadOoxmlZip(buffer);
     } catch (error) {
       throw new PptxPackageError(
         "damaged",

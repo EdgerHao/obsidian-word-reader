@@ -32,6 +32,24 @@ GitHub Actions uploads all three files for 90 days on every CI run, including
 failed budget runs. A failure identifies the format, aggregate, stage/metric,
 observed value, and threshold.
 
+`npm run lifecycle:check` is the companion long-cycle gate. It runs four
+100-cycle sequences (DOCX, PPTX, XLSX, and mixed) with forced garbage
+collection, plus 300 repeated damaged/encrypted/over-limit/unsupported package
+attempts. It verifies that Blob URLs, format caches, background tasks, timers,
+observers, listeners, and stale UI commits return to zero; retained heap has no
+20-sample monotonic run; and no Promise rejection escapes cancellation.
+
+Lifecycle files are also written to `benchmark-results/` and retained by CI:
+
+- `lifecycle-stress.latest.json`: complete operations, resources, heap samples,
+  stale-task outcomes, and error matrix;
+- `lifecycle-stress-trend.json`: compact commit/run trend point; and
+- `lifecycle-stress-summary.md`: CI job summary.
+
+The thresholds are versioned in `lifecycle-stress-budget.json`. Fixture labels
+and artifacts contain no document content, cell values, speaker notes, internal
+XML, or vault paths.
+
 Node.js measurements do not model Electron layout, paint, or long tasks. Use
 the companion [Obsidian Desktop baseline](./OBSIDIAN_DESKTOP_BASELINE.md) to
 calibrate these gates against actual application behavior.

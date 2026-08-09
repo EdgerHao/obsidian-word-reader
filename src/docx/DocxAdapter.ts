@@ -1,6 +1,6 @@
 import type { App, TFile } from "obsidian";
-import JSZip from "jszip";
 
+import { loadOoxmlZip } from "../ooxml/jszipReader";
 import { enforceOoxmlPackagePolicy } from "../ooxml/packagePolicy";
 import {
   DEFAULT_DOCX_ZIP_LIMITS,
@@ -53,9 +53,6 @@ export const DOCX_ADAPTER = new DocxAdapter();
 
 export async function validateDocxPackage(buffer: ArrayBuffer): Promise<void> {
   validateZipSafety(buffer, DEFAULT_DOCX_ZIP_LIMITS);
-  const zip = await JSZip.loadAsync(buffer, {
-    createFolders: false,
-    checkCRC32: false,
-  });
+  const zip = await loadOoxmlZip(buffer);
   await enforceOoxmlPackagePolicy(zip, "docx");
 }

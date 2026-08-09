@@ -29,6 +29,10 @@ import {
   formatWordDiagnostics,
 } from "./docxErrors";
 import { ReaderLifecycle } from "../reader/lifecycle";
+import {
+  type ReaderFileChange,
+  type ReaderFileRevision,
+} from "../reader/fileRevision";
 import { formatReaderDiagnosticReport } from "../reader/diagnostics";
 import {
   createReaderPerformanceDiagnosticReport,
@@ -54,7 +58,13 @@ import {
 } from "../reader/zoom";
 import { TextSearchIndex } from "../reader/textSearchIndex";
 import type { ReaderSession } from "../reader/session";
+import {
+  getReaderRecoveryText,
+  type ReaderRecoveryReason,
+} from "../reader/recovery";
+import { ReaderResourceScope } from "../reader/resourceScope";
 import { OfficeReaderShell } from "../reader/shell";
+import type { ReaderWorkspaceRecoveryReason } from "../reader/workspaceRecovery";
 import type { ReaderCapability } from "../reader/capabilities";
 import {
   DOCX_ADAPTER,
@@ -141,6 +151,10 @@ export class DocxSession extends FileView implements ReaderSession {
   private searchQuery = "";
   private lastDiagnosticsText: string | null = null;
   private readonly performanceTracker = new ReaderPerformanceTracker();
+  private readonly sessionResources = new ReaderResourceScope((error) => {
+    console.error("Office Reader DOCX lifecycle cleanup failed", error);
+  });
+  private fileRevision: ReaderFileRevision | null = null;
   private maximumDomNodes = 0;
 
   constructor(leaf: WorkspaceLeaf, plugin: WordReaderPlugin) {
@@ -179,6 +193,11 @@ export class DocxSession extends FileView implements ReaderSession {
     this.cancelSearchWork();
     this.releaseDocumentState();
     this.clearRenderedDocument();
+    this.lastDiagnosticsText = null;
+    this.fileRevision = null;
+    this.sessionResources.clear();
+    await this.sessionResources.drainTasks();
+    this.sessionResources.clear();
     this.contentEl.empty();
   }
 
@@ -189,15 +208,16 @@ export class DocxSession extends FileView implements ReaderSession {
 
   async onUnloadFile(): Promise<void> {
     this.saveReadingState();
-    await this.plugin.flushData();
     this.activeFilePath = null;
     this.renderLifecycle.cancel();
     this.cancelScrollFrame();
     this.cancelSearchWork();
     this.releaseDocumentState();
     this.clearRenderedDocument();
+    this.fileRevision = null;
     this.updateSearchState();
     this.setStatus("");
+    await this.plugin.flushData();
   }
 
   async reload(): Promise<void> {
@@ -205,8 +225,31 @@ export class DocxSession extends FileView implements ReaderSession {
       return;
     }
 
-    this.captureScrollPosition();
+    if (this.activeFilePath) {
+      this.captureScrollPosition();
+    } else {
+      this.restoreReadingState(this.file);
+    }
     await this.loadDocx(this.file, { force: true });
+  }
+
+  handleFileChange(change: ReaderFileChange): void {
+    if (
+      change.path !== this.activeFilePath &&
+      change.path !== this.file?.path
+    ) {
+      return;
+    }
+    const reason = change.kind === "renamed" &&
+      change.newExtension &&
+      !this.adapter.supports({ extension: change.newExtension })
+      ? "format-changed"
+      : change.kind;
+    this.invalidateForRecovery(reason);
+  }
+
+  handleWorkspaceRecovery(reason: ReaderWorkspaceRecoveryReason): void {
+    this.invalidateForRecovery(reason);
   }
 
   async openExternal(): Promise<void> {
@@ -331,7 +374,7 @@ export class DocxSession extends FileView implements ReaderSession {
     this.cancelSearchWork();
     this.buildLayout();
     if (file) {
-      void this.loadDocx(file, { force: true });
+      this.sessionResources.runTask(() => this.loadDocx(file, { force: true }));
     }
   }
 
@@ -354,7 +397,7 @@ export class DocxSession extends FileView implements ReaderSession {
       "refresh-cw",
       text.toolbar.reload,
       () => {
-        void this.reload();
+        this.sessionResources.runTask(() => this.reload());
       },
     );
 
@@ -404,7 +447,9 @@ export class DocxSession extends FileView implements ReaderSession {
         this.applyOutlineVisibility();
         this.saveReadingState();
         if (this.outlineVisible && this.renderedDocumentKey) {
-          void this.updateOutline(this.renderLifecycle.currentToken);
+          this.sessionResources.runTask(() =>
+            this.updateOutline(this.renderLifecycle.currentToken)
+          );
         }
       },
     );
@@ -470,7 +515,7 @@ export class DocxSession extends FileView implements ReaderSession {
       "copy",
       text.toolbar.copyText,
       () => {
-        void this.copyText();
+        this.sessionResources.runTask(() => this.copyText());
       },
     );
 
@@ -480,7 +525,7 @@ export class DocxSession extends FileView implements ReaderSession {
       "clipboard-copy",
       text.toolbar.copyMarkdown,
       () => {
-        void this.copyMarkdown();
+        this.sessionResources.runTask(() => this.copyMarkdown());
       },
     );
 
@@ -490,7 +535,7 @@ export class DocxSession extends FileView implements ReaderSession {
       "file-plus",
       text.toolbar.createSummaryNote,
       () => {
-        void this.createSummaryNote();
+        this.sessionResources.runTask(() => this.createSummaryNote());
       },
     );
 
@@ -500,7 +545,7 @@ export class DocxSession extends FileView implements ReaderSession {
       "external-link",
       text.toolbar.openExternally,
       () => {
-        void this.openExternal();
+        this.sessionResources.runTask(() => this.openExternal());
       },
     );
 
@@ -536,6 +581,10 @@ export class DocxSession extends FileView implements ReaderSession {
 
     const previousToken = this.renderLifecycle.currentToken;
     const token = this.renderLifecycle.begin();
+    this.fileRevision = this.plugin.captureFileRevision(
+      file,
+      this.adapter.format,
+    );
     const loadStartedAt = performance.now();
     this.performanceTracker.reset();
     if (previousToken > 0) {
@@ -591,17 +640,22 @@ export class DocxSession extends FileView implements ReaderSession {
 
     try {
       await yieldToBrowser();
-      if (!this.renderLifecycle.isCurrent(token)) {
+      if (!this.isLoadCurrent(token)) {
         return;
       }
 
       const readStartedAt = performance.now();
       const buffer = await this.adapter.open(this.app, file);
-      if (!this.renderLifecycle.isCurrent(token)) {
+      if (!this.isLoadCurrent(token)) {
         return;
       }
 
       this.buffer = buffer;
+      this.sessionResources.track("caches", "docx-buffer", () => {
+        if (this.buffer === buffer) {
+          this.buffer = null;
+        }
+      });
       const readDurationMs = performance.now() - readStartedAt;
       this.performanceTracker.recordTiming("packageLoadMs", readDurationMs);
       await this.renderCurrentBuffer(token, renderKey, {
@@ -609,7 +663,7 @@ export class DocxSession extends FileView implements ReaderSession {
         readDurationMs,
       });
     } catch (error) {
-      if (!this.renderLifecycle.isCurrent(token)) {
+      if (!this.isLoadCurrent(token)) {
         return;
       }
 
@@ -647,7 +701,7 @@ export class DocxSession extends FileView implements ReaderSession {
     this.updateSearchState();
     this.setStatus(this.text.status.rendering(this.file.name), false, true);
     await yieldToBrowser();
-    if (!this.renderLifecycle.isCurrent(token)) {
+    if (!this.isLoadCurrent(token)) {
       return;
     }
 
@@ -673,7 +727,7 @@ export class DocxSession extends FileView implements ReaderSession {
       adoptedBlobUrls = true;
       await this.commitRenderedDocument(renderTargetEl, token, this.file.name);
 
-      if (!this.renderLifecycle.isCurrent(token)) {
+      if (!this.isLoadCurrent(token)) {
         return;
       }
 
@@ -705,7 +759,7 @@ export class DocxSession extends FileView implements ReaderSession {
         outlineDurationMs,
       );
 
-      if (!this.renderLifecycle.isCurrent(token)) {
+      if (!this.isLoadCurrent(token)) {
         return;
       }
 
@@ -761,7 +815,7 @@ export class DocxSession extends FileView implements ReaderSession {
     let completedUnits = 0;
 
     for (const node of topLevelNodes) {
-      if (!this.renderLifecycle.isCurrent(token) || this.documentEl !== targetEl) {
+      if (!this.isLoadCurrent(token) || this.documentEl !== targetEl) {
         return;
       }
 
@@ -781,7 +835,7 @@ export class DocxSession extends FileView implements ReaderSession {
           index += DOM_COMMIT_CHUNK_SIZE
         ) {
           if (
-            !this.renderLifecycle.isCurrent(token) ||
+            !this.isLoadCurrent(token) ||
             this.documentEl !== targetEl
           ) {
             return;
@@ -925,7 +979,7 @@ export class DocxSession extends FileView implements ReaderSession {
     ) {
       if (
         taskToken !== this.outlineTaskToken ||
-        !this.renderLifecycle.isCurrent(token) ||
+        !this.isLoadCurrent(token) ||
         this.documentEl !== documentEl ||
         this.outlineListEl !== outlineListEl
       ) {
@@ -1003,7 +1057,9 @@ export class DocxSession extends FileView implements ReaderSession {
       this.collapsedOutlineIds.add(id);
     }
     this.saveReadingState();
-    void this.updateOutline(this.renderLifecycle.currentToken);
+    this.sessionResources.runTask(() =>
+      this.updateOutline(this.renderLifecycle.currentToken)
+    );
   }
 
   private scheduleScrollUpdate(): void {
@@ -1012,7 +1068,7 @@ export class DocxSession extends FileView implements ReaderSession {
     }
 
     const scrollWindow = this.scrollEl?.win ?? window;
-    this.scrollFrameId = scrollWindow.requestAnimationFrame(() => {
+    this.scrollFrameId = this.sessionResources.requestFrame(scrollWindow, () => {
       this.scrollFrameId = null;
       const startedAt = performance.now();
       this.saveReadingState();
@@ -1029,7 +1085,7 @@ export class DocxSession extends FileView implements ReaderSession {
     }
 
     const scrollWindow = this.scrollEl?.win ?? window;
-    scrollWindow.cancelAnimationFrame(this.scrollFrameId);
+    this.sessionResources.cancelFrame(scrollWindow, this.scrollFrameId);
     this.scrollFrameId = null;
   }
 
@@ -1209,7 +1265,9 @@ export class DocxSession extends FileView implements ReaderSession {
       cls: "office-reader-message-actions word-reader-message-actions",
     });
     this.createIconButton(actionsEl, "external-link", this.text.toolbar.openExternally, () => {
-      void openExternalDocx(this.app, file, this.text);
+      this.sessionResources.runTask(() =>
+        openExternalDocx(this.app, file, this.text)
+      );
     });
     this.setStatus(this.text.status.legacyDoc(file.name));
   }
@@ -1242,7 +1300,9 @@ export class DocxSession extends FileView implements ReaderSession {
       "clipboard-copy",
       this.text.errors.copyDiagnostics,
       () => {
-        void this.writeDiagnostics(formattedDiagnostics);
+        this.sessionResources.runTask(() =>
+          this.writeDiagnostics(formattedDiagnostics)
+        );
       },
     );
     this.createIconButton(
@@ -1250,12 +1310,47 @@ export class DocxSession extends FileView implements ReaderSession {
       "external-link",
       this.text.toolbar.openExternally,
       () => {
-        void openExternalDocx(this.app, file, this.text);
+        this.sessionResources.runTask(() =>
+          openExternalDocx(this.app, file, this.text)
+        );
       },
     );
 
     this.lastDiagnosticsText = formattedDiagnostics;
     this.setStatus(errorInfo.status, true);
+  }
+
+  private invalidateForRecovery(reason: ReaderRecoveryReason): void {
+    this.activeFilePath = null;
+    this.pendingScrollPosition = null;
+    this.lastDiagnosticsText = null;
+    this.fileRevision = null;
+    this.renderLifecycle.cancel();
+    this.cancelScrollFrame();
+    this.cancelSearchWork();
+    this.releaseDocumentState();
+    this.clearRenderedDocument();
+    this.ensureLayout();
+    if (!this.documentEl) {
+      return;
+    }
+    const recovery = getReaderRecoveryText(
+      this.plugin.settings.common.language,
+      reason,
+    );
+    this.shell.renderRecoveryError(this.documentEl, recovery, () => {
+      this.sessionResources.runTask(() => this.reload());
+    });
+    this.setStatus(recovery.status, true);
+  }
+
+  private isLoadCurrent(token: number): boolean {
+    return this.renderLifecycle.isCurrent(token) &&
+      this.plugin.isFileRevisionCurrent(
+        this.fileRevision,
+        this.file,
+        this.adapter.format,
+      );
   }
 
   private async writeDiagnostics(diagnostics: string): Promise<void> {
@@ -1317,9 +1412,11 @@ export class DocxSession extends FileView implements ReaderSession {
   private scheduleSearchHighlights(): void {
     this.clearSearchTimer();
     const taskToken = ++this.searchTaskToken;
-    this.searchHighlightTimer = window.setTimeout(() => {
+    this.searchHighlightTimer = this.sessionResources.setTimer(window, () => {
       this.searchHighlightTimer = null;
-      void this.updateSearchHighlights(taskToken);
+      this.sessionResources.runTask(() =>
+        this.updateSearchHighlights(taskToken)
+      );
     }, SEARCH_DEBOUNCE_MS);
   }
 
@@ -1333,7 +1430,7 @@ export class DocxSession extends FileView implements ReaderSession {
       return;
     }
 
-    window.clearTimeout(this.searchHighlightTimer);
+    this.sessionResources.clearTimer(window, this.searchHighlightTimer);
     this.searchHighlightTimer = null;
   }
 
@@ -1492,7 +1589,7 @@ export class DocxSession extends FileView implements ReaderSession {
     }
 
     await yieldToBrowser();
-    if (!this.renderLifecycle.isCurrent(token) || !this.scrollEl) {
+    if (!this.isLoadCurrent(token) || !this.scrollEl) {
       return;
     }
 
@@ -1553,6 +1650,7 @@ export class DocxSession extends FileView implements ReaderSession {
 
   private releaseDocumentState(): void {
     this.cancelSearchWork();
+    this.sessionResources.clear("caches");
     this.buffer = null;
     this.extractedPlainText = null;
     this.extractedMarkdown = null;
@@ -1866,6 +1964,9 @@ function clamp(value: number, min: number, max: number): number {
 }
 
 class ImagePreviewModal extends Modal {
+  private readonly resources = new ReaderResourceScope((error) => {
+    console.error("Office Reader image preview task failed", error);
+  });
   private viewportEl: HTMLElement | null = null;
   private imageEl: HTMLImageElement | null = null;
   private statusEl: HTMLElement | null = null;
@@ -1891,7 +1992,7 @@ class ImagePreviewModal extends Modal {
 
     event.preventDefault();
     event.stopPropagation();
-    void this.copyImage();
+    this.resources.runTask(() => this.copyImage());
   };
 
   constructor(
@@ -1910,7 +2011,11 @@ class ImagePreviewModal extends Modal {
     this.contentEl.empty();
     this.titleEl.setText(this.alt);
     this.contentEl.addClass("word-reader-image-modal");
-    this.contentEl.doc.addEventListener("keydown", this.handleKeyDown);
+    this.resources.listen(
+      this.contentEl.doc,
+      "keydown",
+      this.handleKeyDown,
+    );
 
     const toolbarEl = this.contentEl.createDiv({
       cls: "word-reader-image-toolbar",
@@ -1922,10 +2027,10 @@ class ImagePreviewModal extends Modal {
       this.showActualSize();
     });
     this.createToolbarButton(toolbarEl, "copy", this.text.imagePreview.copyImage, () => {
-      void this.copyImage();
+      this.resources.runTask(() => this.copyImage());
     });
     this.createToolbarButton(toolbarEl, "download", this.text.imagePreview.saveImageAs, () => {
-      void this.saveImageAs();
+      this.resources.runTask(() => this.saveImageAs());
     });
     this.statusEl = toolbarEl.createSpan({
       cls: "word-reader-image-status",
@@ -1974,7 +2079,7 @@ class ImagePreviewModal extends Modal {
   }
 
   onClose(): void {
-    this.contentEl.doc.removeEventListener("keydown", this.handleKeyDown);
+    this.resources.clear();
     this.releaseResource?.();
     this.contentEl.empty();
   }

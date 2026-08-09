@@ -47,6 +47,8 @@ Requires Obsidian Desktop 1.12.7 or newer.
 - Show a clear fallback page for legacy `.doc` files with external-open and conversion guidance.
 - Show clearer messages for encrypted, damaged, or unsupported Word documents.
 - Avoid stale render results when switching or reloading documents.
+- Detect source replacement during a read, discard stale preview/search/cache
+  state, and offer a recoverable reload page instead of committing old work.
 - Create or open same-name Markdown summary notes linked back to source
   `.docx`, `.pptx`, and `.xlsx` files. Presentation notes include numbered
   slide references; spreadsheet notes include workbook structure, named
@@ -215,6 +217,12 @@ Available settings:
 
 ## Performance and Stability
 
+- `npm run lifecycle:check` runs 100 open/reload/navigation/switch/close cycles
+  for DOCX, PPTX, XLSX, and a mixed sequence under forced GC. It gates Blob
+  URLs, caches, tasks, timers, observers, listeners, stale UI commits,
+  retained-heap trends, recoverable package errors, and unhandled rejections.
+  Full JSON, a compact trend point, and a Markdown summary are written under
+  `benchmark-results/` and uploaded by CI for 90 days.
 - `npm run performance:check` executes five isolated DOCX, PPTX, and XLSX
   samples, gates p95 regressions by format and stage, and writes full JSON,
   compact CI trend JSON, and a Markdown summary under `benchmark-results/`.
@@ -226,8 +234,14 @@ Available settings:
   format-specific adapters and sessions.
 - Persisted settings use an explicit schema version with separate `common`,
   `docx`, `pptx`, and `xlsx` sections. Pre-2.4 flat settings migrate
-  automatically.
-- Rendering work is guarded by a cancellation token so stale results are discarded.
+  automatically. Corrupt or partial data falls back field by field; a raw load
+  failure is never overwritten by an automatic repair write.
+- File modification, deletion, rename, and restored-workspace format mismatch
+  invalidate the active generation before stale parse, search, thumbnail,
+  worksheet, drawing, or DOM work can commit. Duplicate valid restored views
+  remain isolated and do not block startup.
+- Rendering work is guarded by cancellation and file-revision tokens so stale
+  results are discarded.
 - PPTX file and slide rendering use separate cancellation generations so rapid
   file switching and page navigation cannot commit stale slides.
 - The current PPTX slide renders before full metadata indexing finishes.

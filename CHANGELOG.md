@@ -1,5 +1,80 @@
 # Changelog
 
+## 3.4.0 - 2026-08-09
+
+### English
+
+#### Added
+
+- Added independent DOCX, PPTX, XLSX, and mixed lifecycle stress sequences.
+  Every sequence performs 100 open, forced-reload, fast-navigation,
+  file-switch, and close cycles under forced garbage collection.
+- Added machine-readable lifecycle results, compact CI trend points, Markdown
+  job summaries, explicit heap/resource budgets, and 90-day CI artifacts.
+- Added shared ownership diagnostics for Blob URLs, format caches, background
+  tasks, timers/animation frames, observers, and document listeners.
+- Added recovery coverage for corrupt, legacy, partially written, and
+  unknown-field settings; same-stat file replacement; missing or
+  format-changed workspace leaves; and duplicate restored views.
+
+#### Changed
+
+- DOCX, PPTX, and XLSX sessions now invalidate stale file revisions before
+  parse, search, thumbnail, worksheet, drawing, navigation, or DOM work can
+  update the current view. Recovery pages offer an explicit reload action.
+- Long-lived session tasks catch rejection centrally, while package caches,
+  generated Blob URLs, timers, animation frames, observers, and global
+  listeners are cancelled or released on reload, switch, recovery, and close.
+- Source-file replacement clears stale position/navigation state, including
+  replacements that retain the same modification time and byte size, while
+  preserving zoom and fit preferences.
+- Production packaging now uses the pinned JSZip loader through a minimal
+  read-only host, excluding unused archive-generation and deflate code while
+  preserving the 500 KiB bundle budget.
+
+#### Fixed
+
+- Plugin startup now falls back safely when settings loading fails and repairs
+  independently migratable fields without overwriting data after a raw load
+  failure. Save interruption is logged without leaking a rejected unload task.
+- Workspace restoration isolates missing files and changed formats without
+  blocking valid or duplicate reader leaves from opening.
+- Repeated damaged, encrypted, over-limit, and unsupported Office packages
+  remain recoverable and leave no tracked resources or unhandled Promise
+  rejections after cancellation.
+
+### 中文
+
+#### 新增
+
+- 增加 DOCX、PPTX、XLSX 和混合顺序四组独立生命周期压力测试；每组在强制
+  GC 下完成 100 次打开、强制重载、快速导航、文件切换和关闭循环。
+- 增加机器可读生命周期结果、精简 CI 趋势点、Markdown 任务摘要、显式堆/资源
+  预算和保存 90 天的 CI 产物。
+- 统一观测 Blob URL、格式缓存、后台任务、定时器/动画帧、观察器和文档监听器
+  的所有权与清理结果。
+- 增加损坏/旧版/部分写入/未知字段设置、同统计值文件替换、工作区文件缺失、
+  格式变更和重复恢复视图的故障恢复覆盖。
+
+#### 变更
+
+- DOCX、PPTX 和 XLSX 会话会在解析、搜索、缩略图、工作表、绘图、导航或 DOM
+  工作更新当前视图前校验文件代次；失效页面提供明确的重新加载入口。
+- 长生命周期任务统一捕获 rejection；包缓存、Blob URL、定时器、动画帧、观察器
+  和全局监听器会在重载、切换、恢复和关闭时取消或释放。
+- 源文件替换会清除旧位置与导航状态；即使修改时间和字节数不变也不会混用旧
+  状态，同时保留缩放和适配偏好。
+- 生产构建通过最小只读宿主使用锁定版本的 JSZip 读取器，排除未使用的归档生成
+  和 deflate 代码，并继续满足 500 KiB bundle 预算。
+
+#### 修复
+
+- 设置读取失败时插件可安全启动；可迁移字段会独立修复，而原始加载失败后不会
+  覆盖仍可能人工恢复的数据。保存中断只记录错误，不会泄漏 unload rejection。
+- 工作区恢复会隔离缺失文件和格式变更，不阻止合法或重复阅读视图启动。
+- 损坏、加密、超限和不支持 Office 包反复失败时仍保持可恢复，取消后不残留已
+  跟踪资源，也不产生未处理 Promise rejection。
+
 ## 3.3.0 - 2026-08-02
 
 ### English

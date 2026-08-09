@@ -8,9 +8,14 @@ Community directory and before publishing later releases.
 - [ ] Run `npm ci` from a clean checkout.
 - [ ] Run `npm run check`.
 - [ ] Run `npm run release`.
+- [ ] Confirm `npm run zip-reader:check` validates the production inflate-only
+  async and streamed OOXML read path.
 - [ ] Confirm `npm run performance:check` passes DOCX, PPTX, and XLSX budgets,
   reports `dist/main.js` at or below 500 KiB and the release zip at or below
   8 MiB, and writes the machine-readable CI trend artifacts.
+- [ ] Confirm `npm run lifecycle:check` completes four 100-cycle sequences and
+  the 300-attempt recovery matrix with zero resource residue, stale UI commits,
+  sustained heap growth, or unhandled Promise rejections.
 - [ ] Run `node scripts/release-check.mjs --tag X.Y.Z`.
 - [ ] Confirm all commands finish without warnings or errors.
 - [ ] Confirm `release/obsidian-word-reader-X.Y.Z.zip` contains only

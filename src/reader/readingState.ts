@@ -140,6 +140,22 @@ export class ReadingStateStore {
     return this.entries.size;
   }
 
+  invalidate(path: string): boolean {
+    const entry = this.entries.get(path);
+    if (!entry) {
+      return false;
+    }
+    const preference = stateFromEntry(entry);
+    entry.position = { scrollLeft: 0, scrollTop: 0 };
+    entry.zoom = { scale: preference.zoom, fit: preference.fitWidth };
+    entry.navigation = {
+      panelVisible: defaultPanelVisibility(entry.format),
+      collapsedIds: [],
+    };
+    entry.lastAccessed = this.nextAccess();
+    return true;
+  }
+
   private nextAccess(): number {
     this.accessCounter += 1;
     return this.accessCounter;

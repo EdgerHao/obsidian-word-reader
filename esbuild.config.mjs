@@ -2,6 +2,7 @@ import esbuild from "esbuild";
 import process from "process";
 import fs from "fs/promises";
 import { builtinModules } from "node:module";
+import path from "node:path";
 
 const production = process.argv[2] === "production";
 const outputDir = "dist";
@@ -25,15 +26,24 @@ const copyAssetsPlugin = {
   },
 };
 
+const readOnlyZipPlugin = {
+  name: "read-only-zip",
+  setup(build) {
+    build.onResolve({ filter: /^jszip$/ }, () => ({
+      path: path.resolve("src/ooxml/jszipReader.ts"),
+    }));
+    build.onResolve({ filter: /^pako$/ }, () => ({
+      path: path.resolve("node_modules/pako/lib/inflate.js"),
+    }));
+  },
+};
+
 const context = await esbuild.context({
   banner: {
     js: "/* Office Reader */",
   },
   entryPoints: ["src/main.ts"],
   bundle: true,
-  alias: {
-    "jszip": "jszip/lib/index.js"
-  },
   external: [
     "obsidian",
     "electron",
@@ -61,7 +71,7 @@ const context = await esbuild.context({
   treeShaking: true,
   outfile: `${outputDir}/main.js`,
   minify: production,
-  plugins: [copyAssetsPlugin],
+  plugins: [readOnlyZipPlugin, copyAssetsPlugin],
 });
 
 if (production) {

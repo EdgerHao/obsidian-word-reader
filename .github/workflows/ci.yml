@@ -34,6 +34,11 @@ jobs:
         shell: bash
         run: cat benchmark-results/performance-summary.md >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Add lifecycle stress summary
+        if: ${{ always() && hashFiles('benchmark-results/lifecycle-stress-summary.md') != '' }}
+        shell: bash
+        run: cat benchmark-results/lifecycle-stress-summary.md >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload performance trend point
         if: always()
         uses: actions/upload-artifact@v4
@@ -43,5 +48,17 @@ jobs:
             benchmark-results/performance.latest.json
             benchmark-results/performance-trend.json
             benchmark-results/performance-summary.md
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Upload lifecycle trend point
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: office-reader-lifecycle-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            benchmark-results/lifecycle-stress.latest.json
+            benchmark-results/lifecycle-stress-trend.json
+            benchmark-results/lifecycle-stress-summary.md
           if-no-files-found: warn
           retention-days: 90

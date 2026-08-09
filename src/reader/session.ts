@@ -2,6 +2,8 @@ import type { TFile } from "obsidian";
 
 import type { OfficeReaderAdapter } from "./adapters";
 import type { ReaderCapabilities } from "./capabilities";
+import type { ReaderFileChange } from "./fileRevision";
+import type { ReaderWorkspaceRecoveryReason } from "./workspaceRecovery";
 
 export interface ReaderSession {
   readonly adapter: OfficeReaderAdapter<unknown, unknown>;
@@ -14,6 +16,8 @@ export interface ReaderSession {
   onUnloadFile: (file: TFile) => Promise<void>;
   reload: () => Promise<void>;
   refreshInterfaceLanguage: () => void;
+  handleFileChange?: (change: ReaderFileChange) => void;
+  handleWorkspaceRecovery?: (reason: ReaderWorkspaceRecoveryReason) => void;
   copyText?: () => Promise<void>;
   copyFormulas?: () => Promise<void>;
   copyMarkdown?: () => Promise<void>;

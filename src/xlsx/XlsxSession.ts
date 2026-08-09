@@ -11,6 +11,10 @@ import { openExternalFile } from "../commands/openExternal";
 import type WordReaderPlugin from "../main";
 import type { ReaderCapability } from "../reader/capabilities";
 import { ReaderLifecycle } from "../reader/lifecycle";
+import {
+  type ReaderFileChange,
+  type ReaderFileRevision,
+} from "../reader/fileRevision";
 import { formatReaderDiagnosticReport } from "../reader/diagnostics";
 import {
   createReaderPerformanceDiagnosticReport,
@@ -18,7 +22,13 @@ import {
 } from "../reader/performanceDiagnostics";
 import type { ReaderViewState } from "../reader/readingState";
 import type { ReaderSession } from "../reader/session";
+import {
+  getReaderRecoveryText,
+  type ReaderRecoveryReason,
+} from "../reader/recovery";
+import { ReaderResourceScope } from "../reader/resourceScope";
 import { OfficeReaderShell } from "../reader/shell";
+import type { ReaderWorkspaceRecoveryReason } from "../reader/workspaceRecovery";
 import {
   ReaderStatusController,
   type ReaderStatus,
@@ -157,6 +167,10 @@ export class XlsxSession extends FileView implements ReaderSession {
   >();
   private imageResourceGeneration = 0;
   private readonly performanceTracker = new ReaderPerformanceTracker();
+  private readonly sessionResources = new ReaderResourceScope((error) => {
+    console.error("Office Reader XLSX lifecycle task failed", error);
+  });
+  private fileRevision: ReaderFileRevision | null = null;
   private performanceLoadStartedAt: number | null = null;
   private firstReadableRecorded = false;
   private maximumDomNodes = 0;
@@ -193,17 +207,20 @@ export class XlsxSession extends FileView implements ReaderSession {
 
   async onOpen(): Promise<void> {
     this.buildLayout();
-    this.contentEl.doc.addEventListener("pointerup", this.handlePointerUp);
+    this.sessionResources.listen(
+      this.contentEl.doc,
+      "pointerup",
+      this.handlePointerUp,
+    );
     this.resizeObserver = new ResizeObserver(() => {
       this.applyScale();
       this.scheduleGridRender();
     });
-    this.resizeObserver.observe(this.contentEl);
+    this.sessionResources.observe(this.resizeObserver, this.contentEl);
   }
 
   async onClose(): Promise<void> {
-    this.contentEl.doc.removeEventListener("pointerup", this.handlePointerUp);
-    this.resizeObserver?.disconnect();
+    this.sessionResources.clear();
     this.resizeObserver = null;
     this.cancelScheduledWork();
     this.loadLifecycle.cancel();
@@ -211,6 +228,9 @@ export class XlsxSession extends FileView implements ReaderSession {
     this.searchLifecycle.cancel();
     this.summaryLifecycle.cancel();
     this.releaseWorkbook();
+    this.fileRevision = null;
+    await this.sessionResources.drainTasks();
+    this.sessionResources.clear();
   }
 
   async onLoadFile(file: TFile): Promise<void> {
@@ -220,7 +240,6 @@ export class XlsxSession extends FileView implements ReaderSession {
 
   async onUnloadFile(): Promise<void> {
     this.saveReadingState();
-    await this.plugin.flushData();
     this.activeFilePath = null;
     this.loadLifecycle.cancel();
     this.sheetLifecycle.cancel();
@@ -228,13 +247,37 @@ export class XlsxSession extends FileView implements ReaderSession {
     this.summaryLifecycle.cancel();
     this.cancelScheduledWork();
     this.releaseWorkbook();
+    this.fileRevision = null;
     this.setStatus("");
+    await this.plugin.flushData();
   }
 
   async reload(): Promise<void> {
     if (this.file) {
+      if (!this.activeFilePath) {
+        this.restoreReadingState(this.file);
+      }
       await this.loadWorkbook(this.file);
     }
+  }
+
+  handleFileChange(change: ReaderFileChange): void {
+    if (
+      change.path !== this.activeFilePath &&
+      change.path !== this.file?.path
+    ) {
+      return;
+    }
+    const reason = change.kind === "renamed" &&
+      change.newExtension &&
+      !this.adapter.supports({ extension: change.newExtension })
+      ? "format-changed"
+      : change.kind;
+    this.invalidateForRecovery(reason);
+  }
+
+  handleWorkspaceRecovery(reason: ReaderWorkspaceRecoveryReason): void {
+    this.invalidateForRecovery(reason);
   }
 
   async copyDiagnostics(): Promise<void> {
@@ -323,6 +366,7 @@ export class XlsxSession extends FileView implements ReaderSession {
       const summary = await collectXlsxWorkbookSummary(workbook, {
         isCancelled: () =>
           !this.summaryLifecycle.isCurrent(token) ||
+          !this.isFileCurrent() ||
           this.workbook !== workbook ||
           this.activeSheetIndex !== sheetIndex,
         yieldControl: () => yieldToWindow(this.contentEl.win),
@@ -340,6 +384,7 @@ export class XlsxSession extends FileView implements ReaderSession {
       });
       if (
         !this.summaryLifecycle.isCurrent(token) ||
+        !this.isFileCurrent() ||
         this.workbook !== workbook
       ) {
         return;
@@ -362,7 +407,7 @@ export class XlsxSession extends FileView implements ReaderSession {
       }
       new Notice(this.text.notices.summaryFailed(getErrorMessage(error)));
     } finally {
-      if (this.summaryLifecycle.isCurrent(token)) {
+      if (this.summaryLifecycle.isCurrent(token) && this.isFileCurrent()) {
         this.setReadyStatus();
       }
     }
@@ -424,7 +469,7 @@ export class XlsxSession extends FileView implements ReaderSession {
       "refresh-cw",
       text.toolbar.reload,
       () => {
-        void this.reload();
+        this.sessionResources.runTask(() => this.reload());
       },
     );
 
@@ -448,7 +493,9 @@ export class XlsxSession extends FileView implements ReaderSession {
     this.searchInputEl.addEventListener("keydown", (event) => {
       if (event.key === "Enter") {
         event.preventDefault();
-        void this.goToSearchResult(event.shiftKey ? -1 : 1);
+        this.sessionResources.runTask(() =>
+          this.goToSearchResult(event.shiftKey ? -1 : 1)
+        );
       }
     });
     this.createIconButton(
@@ -456,7 +503,7 @@ export class XlsxSession extends FileView implements ReaderSession {
       "chevron-up",
       text.toolbar.previousResult,
       () => {
-        void this.goToSearchResult(-1);
+        this.sessionResources.runTask(() => this.goToSearchResult(-1));
       },
     );
     this.createIconButton(
@@ -464,7 +511,7 @@ export class XlsxSession extends FileView implements ReaderSession {
       "chevron-down",
       text.toolbar.nextResult,
       () => {
-        void this.goToSearchResult(1);
+        this.sessionResources.runTask(() => this.goToSearchResult(1));
       },
     );
     this.searchCountEl = searchEl.createSpan({
@@ -505,7 +552,7 @@ export class XlsxSession extends FileView implements ReaderSession {
       "copy",
       text.toolbar.copyValues,
       () => {
-        void this.copySelection("display");
+        this.sessionResources.runTask(() => this.copySelection("display"));
       },
     );
     this.createToolbarButton(
@@ -514,7 +561,7 @@ export class XlsxSession extends FileView implements ReaderSession {
       "function-square",
       text.toolbar.copyFormulas,
       () => {
-        void this.copySelection("formula");
+        this.sessionResources.runTask(() => this.copySelection("formula"));
       },
     );
     this.createToolbarButton(
@@ -523,7 +570,7 @@ export class XlsxSession extends FileView implements ReaderSession {
       "table-properties",
       text.toolbar.copyMarkdown,
       () => {
-        void this.copySelectionAsMarkdown();
+        this.sessionResources.runTask(() => this.copySelectionAsMarkdown());
       },
     );
     this.createToolbarButton(
@@ -532,7 +579,7 @@ export class XlsxSession extends FileView implements ReaderSession {
       "notebook-pen",
       text.toolbar.createSummaryNote,
       () => {
-        void this.createSummaryNote();
+        this.sessionResources.runTask(() => this.createSummaryNote());
       },
     );
     this.createToolbarButton(
@@ -541,7 +588,7 @@ export class XlsxSession extends FileView implements ReaderSession {
       "external-link",
       text.toolbar.openExternally,
       () => {
-        void this.openExternal();
+        this.sessionResources.runTask(() => this.openExternal());
       },
     );
 
@@ -564,7 +611,7 @@ export class XlsxSession extends FileView implements ReaderSession {
     this.formulaNameEl.addEventListener("keydown", (event) => {
       if (event.key === "Enter") {
         event.preventDefault();
-        void this.navigateFromNameBox();
+        this.sessionResources.runTask(() => this.navigateFromNameBox());
       } else if (event.key === "Escape") {
         this.updateFormulaBar();
         this.rootEl?.focus();
@@ -607,7 +654,7 @@ export class XlsxSession extends FileView implements ReaderSession {
       "external-link",
       text.labels.openLink,
       () => {
-        void this.openSelectedHyperlink();
+        this.sessionResources.runTask(() => this.openSelectedHyperlink());
       },
     );
 
@@ -666,6 +713,10 @@ export class XlsxSession extends FileView implements ReaderSession {
     this.firstReadableRecorded = false;
     this.maximumDomNodes = 0;
     const token = this.loadLifecycle.begin();
+    this.fileRevision = this.plugin.captureFileRevision(
+      file,
+      this.adapter.format,
+    );
     if (previousToken > 0) {
       this.performanceTracker.recordCancellation(
         !this.loadLifecycle.isCurrent(previousToken),
@@ -676,11 +727,6 @@ export class XlsxSession extends FileView implements ReaderSession {
     this.summaryLifecycle.cancel();
     this.releaseWorkbook();
     this.clearGridMessage();
-    this.searchResults = [];
-    this.searchResultKeys.clear();
-    this.currentSearchResult = -1;
-    this.completedSearchQuery = "";
-    this.updateSearchCount();
 
     if (file.extension.toLowerCase() === "xls") {
       this.showLegacyWorkbook();
@@ -695,11 +741,14 @@ export class XlsxSession extends FileView implements ReaderSession {
         "packageLoadMs",
         performance.now() - packageLoadStartedAt,
       );
-      if (!this.loadLifecycle.isCurrent(token)) {
+      if (!this.isLoadCurrent(token)) {
         workbook.clearCaches();
         return;
       }
       this.workbook = workbook;
+      this.sessionResources.track("caches", workbook, () => {
+        workbook.clearCaches();
+      });
       this.activeSheetIndex = this.normalizeSheetIndex(
         this.activeSheetIndex,
         workbook,
@@ -708,14 +757,14 @@ export class XlsxSession extends FileView implements ReaderSession {
       this.renderNameSuggestions();
       await this.loadWorksheet(this.activeSheetIndex, true);
       if (
-        this.loadLifecycle.isCurrent(token) &&
+        this.isLoadCurrent(token) &&
         this.workbook === workbook &&
         this.searchQuery.trim()
       ) {
         await this.runSearch();
       }
     } catch (error) {
-      if (this.loadLifecycle.isCurrent(token)) {
+      if (this.isLoadCurrent(token)) {
         this.releaseWorkbook();
         this.showError(error);
       }
@@ -750,12 +799,14 @@ export class XlsxSession extends FileView implements ReaderSession {
       const worksheet = await workbook.getWorksheet(index, {
         isCancelled: () =>
           !this.sheetLifecycle.isCurrent(token) ||
+          !this.isFileCurrent() ||
           this.workbook !== workbook,
         onProgress: (percent) => {
           const roundedPercent = Math.round(percent);
           if (
             roundedPercent !== lastReportedProgress &&
             this.sheetLifecycle.isCurrent(token) &&
+            this.isFileCurrent() &&
             this.workbook === workbook
           ) {
             lastReportedProgress = roundedPercent;
@@ -772,6 +823,7 @@ export class XlsxSession extends FileView implements ReaderSession {
       });
       if (
         !this.sheetLifecycle.isCurrent(token) ||
+        !this.isFileCurrent() ||
         this.workbook !== workbook
       ) {
         return;
@@ -804,6 +856,7 @@ export class XlsxSession extends FileView implements ReaderSession {
       }
       if (
         this.sheetLifecycle.isCurrent(token) &&
+        this.isFileCurrent() &&
         this.workbook === workbook
       ) {
         this.showError(error);
@@ -827,11 +880,19 @@ export class XlsxSession extends FileView implements ReaderSession {
   }
 
   private releaseWorkbook(): void {
-    this.workbook?.clearCaches();
+    if (this.workbook) {
+      this.sessionResources.forget("caches", this.workbook);
+      this.workbook.clearCaches();
+    }
     this.workbook = null;
     this.clearWorksheet();
     this.sheetTabsEl?.empty();
     this.nameSuggestionsEl?.empty();
+    this.searchResults = [];
+    this.searchResultKeys.clear();
+    this.currentSearchResult = -1;
+    this.completedSearchQuery = "";
+    this.updateSearchCount();
     this.performanceTracker.recordCleanup(
       this.imageObjectUrls.size === 0 &&
         this.pendingImageObjectUrls.size === 0,
@@ -870,7 +931,7 @@ export class XlsxSession extends FileView implements ReaderSession {
       buttonEl.addEventListener("click", () => {
         if (index !== this.activeSheetIndex) {
           this.pendingScrollPosition = { left: 0, top: 0 };
-          void this.selectWorksheet(index);
+          this.sessionResources.runTask(() => this.selectWorksheet(index));
         }
       });
     }
@@ -902,7 +963,7 @@ export class XlsxSession extends FileView implements ReaderSession {
         buttonEl.addEventListener("click", () => {
           hiddenEl.removeAttribute("open");
           if (index !== this.activeSheetIndex) {
-            void this.selectWorksheet(index);
+            this.sessionResources.runTask(() => this.selectWorksheet(index));
           }
         });
       }
@@ -942,7 +1003,9 @@ export class XlsxSession extends FileView implements ReaderSession {
     if (this.renderFrameId !== null) {
       return;
     }
-    this.renderFrameId = this.contentEl.win.requestAnimationFrame(() => {
+    this.renderFrameId = this.sessionResources.requestFrame(
+      this.contentEl.win,
+      () => {
       this.renderFrameId = null;
       const startedAt = performance.now();
       this.renderGrid();
@@ -960,7 +1023,8 @@ export class XlsxSession extends FileView implements ReaderSession {
         );
         this.firstReadableRecorded = true;
       }
-    });
+      },
+    );
   }
 
   private renderGrid(): void {
@@ -1214,8 +1278,9 @@ export class XlsxSession extends FileView implements ReaderSession {
       }
     });
     cellEl.addEventListener("dblclick", () => {
-      if (cell?.hyperlink) {
-        void this.openHyperlink(cell.hyperlink);
+      const hyperlink = cell?.hyperlink;
+      if (hyperlink) {
+        this.sessionResources.runTask(() => this.openHyperlink(hyperlink));
       }
     });
   }
@@ -1257,7 +1322,9 @@ export class XlsxSession extends FileView implements ReaderSession {
           draggable: "false",
         },
       });
-      void this.attachWorksheetImage(imageEl, image);
+      this.sessionResources.runTask(() =>
+        this.attachWorksheetImage(imageEl, image)
+      );
       mountedDrawings += 1;
     }
     for (const chart of worksheet.charts) {
@@ -1411,6 +1478,9 @@ export class XlsxSession extends FileView implements ReaderSession {
         const url = URL.createObjectURL(
           new Blob([copy.buffer], { type: image.mimeType }),
         );
+        this.sessionResources.track("blobUrls", url, () => {
+          URL.revokeObjectURL(url);
+        });
         this.imageObjectUrls.set(image.path, url);
         this.trimImageObjectUrls();
         return url;
@@ -1433,6 +1503,7 @@ export class XlsxSession extends FileView implements ReaderSession {
         return;
       }
       this.imageObjectUrls.delete(oldest[0]);
+      this.sessionResources.forget("blobUrls", oldest[1]);
       URL.revokeObjectURL(oldest[1]);
     }
   }
@@ -1440,9 +1511,7 @@ export class XlsxSession extends FileView implements ReaderSession {
   private releaseImageObjectUrls(): void {
     this.imageResourceGeneration += 1;
     this.pendingImageObjectUrls.clear();
-    for (const url of this.imageObjectUrls.values()) {
-      URL.revokeObjectURL(url);
-    }
+    this.sessionResources.clear("blobUrls");
     this.imageObjectUrls.clear();
   }
 
@@ -1548,7 +1617,7 @@ export class XlsxSession extends FileView implements ReaderSession {
     }
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "c") {
       event.preventDefault();
-      void this.copySelection("display");
+      this.sessionResources.runTask(() => this.copySelection("display"));
       return;
     }
     if (event.altKey || event.ctrlKey || event.metaKey) {
@@ -1844,11 +1913,11 @@ export class XlsxSession extends FileView implements ReaderSession {
 
   private scheduleSearch(): void {
     if (this.searchTimer !== null) {
-      this.contentEl.win.clearTimeout(this.searchTimer);
+      this.sessionResources.clearTimer(this.contentEl.win, this.searchTimer);
     }
-    this.searchTimer = this.contentEl.win.setTimeout(() => {
+    this.searchTimer = this.sessionResources.setTimer(this.contentEl.win, () => {
       this.searchTimer = null;
-      void this.runSearch();
+      this.sessionResources.runTask(() => this.runSearch());
     }, SEARCH_DEBOUNCE_MS);
   }
 
@@ -1874,6 +1943,7 @@ export class XlsxSession extends FileView implements ReaderSession {
         {
           isCancelled: () =>
             !this.searchLifecycle.isCurrent(token) ||
+            !this.isFileCurrent() ||
             this.workbook !== workbook,
           yieldControl: () => yieldToWindow(this.contentEl.win),
           onSheet: (sheetName, index, count) => {
@@ -1891,6 +1961,7 @@ export class XlsxSession extends FileView implements ReaderSession {
       );
       if (
         !this.searchLifecycle.isCurrent(token) ||
+        !this.isFileCurrent() ||
         this.workbook !== workbook
       ) {
         this.performanceTracker.recordCancellation(true);
@@ -2154,12 +2225,16 @@ export class XlsxSession extends FileView implements ReaderSession {
 
   private scheduleStateSave(): void {
     if (this.stateSaveTimer !== null) {
-      this.contentEl.win.clearTimeout(this.stateSaveTimer);
+      this.sessionResources.clearTimer(this.contentEl.win, this.stateSaveTimer);
     }
-    this.stateSaveTimer = this.contentEl.win.setTimeout(() => {
+    this.stateSaveTimer = this.sessionResources.setTimer(
+      this.contentEl.win,
+      () => {
       this.stateSaveTimer = null;
       this.saveReadingState();
-    }, 250);
+      },
+      250,
+    );
   }
 
   private saveReadingState(): void {
@@ -2224,7 +2299,7 @@ export class XlsxSession extends FileView implements ReaderSession {
       "external-link",
       this.text.toolbar.openExternally,
       () => {
-        void this.openExternal();
+        this.sessionResources.runTask(() => this.openExternal());
       },
     );
     this.setStatus(this.text.status.legacy(file.name));
@@ -2253,7 +2328,7 @@ export class XlsxSession extends FileView implements ReaderSession {
       "refresh-cw",
       this.text.toolbar.reload,
       () => {
-        void this.reload();
+        this.sessionResources.runTask(() => this.reload());
       },
     );
     this.createIconButton(
@@ -2261,10 +2336,54 @@ export class XlsxSession extends FileView implements ReaderSession {
       "external-link",
       this.text.toolbar.openExternally,
       () => {
-        void this.openExternal();
+        this.sessionResources.runTask(() => this.openExternal());
       },
     );
     this.setStatus(info.title, true);
+  }
+
+  private invalidateForRecovery(reason: ReaderRecoveryReason): void {
+    this.activeFilePath = null;
+    this.pendingScrollPosition = null;
+    this.fileRevision = null;
+    this.loadLifecycle.cancel();
+    this.sheetLifecycle.cancel();
+    this.searchLifecycle.cancel();
+    this.summaryLifecycle.cancel();
+    this.cancelScheduledWork();
+    this.releaseWorkbook();
+    this.clearGridMessage();
+    if (!this.gridShellEl) {
+      this.buildLayout();
+    }
+    if (!this.gridShellEl) {
+      return;
+    }
+    const recovery = getReaderRecoveryText(
+      this.plugin.settings.common.language,
+      reason,
+    );
+    this.gridMessageEl = this.shell.renderRecoveryError(
+      this.gridShellEl,
+      recovery,
+      () => {
+        this.sessionResources.runTask(() => this.reload());
+      },
+    );
+    this.gridMessageEl.addClass("xlsx-reader-message");
+    this.setStatus(recovery.status, true);
+  }
+
+  private isFileCurrent(): boolean {
+    return this.plugin.isFileRevisionCurrent(
+      this.fileRevision,
+      this.file,
+      this.adapter.format,
+    );
+  }
+
+  private isLoadCurrent(token: number): boolean {
+    return this.loadLifecycle.isCurrent(token) && this.isFileCurrent();
   }
 
   private clearGridMessage(): void {
@@ -2354,15 +2473,15 @@ export class XlsxSession extends FileView implements ReaderSession {
 
   private cancelScheduledWork(): void {
     if (this.searchTimer !== null) {
-      this.contentEl.win.clearTimeout(this.searchTimer);
+      this.sessionResources.clearTimer(this.contentEl.win, this.searchTimer);
       this.searchTimer = null;
     }
     if (this.stateSaveTimer !== null) {
-      this.contentEl.win.clearTimeout(this.stateSaveTimer);
+      this.sessionResources.clearTimer(this.contentEl.win, this.stateSaveTimer);
       this.stateSaveTimer = null;
     }
     if (this.renderFrameId !== null) {
-      this.contentEl.win.cancelAnimationFrame(this.renderFrameId);
+      this.sessionResources.cancelFrame(this.contentEl.win, this.renderFrameId);
       this.renderFrameId = null;
     }
   }

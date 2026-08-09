@@ -27,14 +27,24 @@ import {
   type ReaderViewState,
 } from "./reader/readingState";
 import {
+  type ReaderFileChange,
+  type ReaderFileDescriptor,
+  type ReaderFileRevision,
+  ReaderFileRevisionTracker,
+} from "./reader/fileRevision";
+import { recoverPluginData } from "./reader/pluginData";
+import {
   isReaderSession,
   type ReaderSession,
 } from "./reader/session";
 import {
+  planReaderWorkspaceRecovery,
+  type ReaderWorkspaceEntry,
+} from "./reader/workspaceRecovery";
+import {
   DEFAULT_OFFICE_READER_SETTINGS,
   WordReaderSettingTab,
   type OfficeReaderSettings,
-  migrateSettings,
   normalizeOfficeReaderSettings,
 } from "./settings";
 
@@ -45,6 +55,7 @@ export default class WordReaderPlugin extends Plugin {
     DEFAULT_OFFICE_READER_SETTINGS,
   );
   private readingStates = new ReadingStateStore();
+  private readonly fileRevisions = new ReaderFileRevisionTracker();
   private dataSaveTimer: number | null = null;
   private dataSavePromise: Promise<void> = Promise.resolve();
 
@@ -79,6 +90,34 @@ export default class WordReaderPlugin extends Plugin {
       [...XLSX_ADAPTER.extensions],
       XLSX_ADAPTER.viewType,
     );
+    this.registerEvent(this.app.vault.on("modify", (file) => {
+      if (file instanceof TFile) {
+        this.notifyReaderFileChange({ kind: "modified", path: file.path });
+      }
+    }));
+    this.registerEvent(this.app.vault.on("delete", (file) => {
+      if (file instanceof TFile) {
+        this.notifyReaderFileChange({ kind: "deleted", path: file.path });
+      }
+    }));
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+      if (file instanceof TFile) {
+        this.fileRevisions.markRenamed(oldPath, file.path);
+        this.notifyReaderFileChange({
+          kind: "renamed",
+          path: oldPath,
+          newPath: file.path,
+          newExtension: file.extension,
+        }, false);
+      }
+    }));
+    this.app.workspace.onLayoutReady(() => {
+      try {
+        this.recoverWorkspaceViews();
+      } catch (error) {
+        console.error("Office Reader could not inspect restored views", error);
+      }
+    });
 
     this.registerReaderCommand(
       "reload",
@@ -264,14 +303,23 @@ export default class WordReaderPlugin extends Plugin {
   }
 
   async loadSettings(): Promise<void> {
-    const loadedData: unknown = await this.loadData();
-    this.settings = migrateSettings(loadedData);
-    this.readingStates = new ReadingStateStore(
-      undefined,
-      getReadingStateData(loadedData),
-    );
-    if (!hasCurrentSettingsSchema(loadedData)) {
-      await this.persistData();
+    let loadedData: unknown;
+    try {
+      loadedData = await this.loadData();
+    } catch (error) {
+      console.error("Office Reader could not load plugin data", error);
+      const recovered = recoverPluginData(undefined);
+      this.settings = recovered.settings;
+      this.readingStates = recovered.readingStates;
+      return;
+    }
+    const recovered = recoverPluginData(loadedData);
+    this.settings = recovered.settings;
+    this.readingStates = recovered.readingStates;
+    if (recovered.requiresRepair) {
+      await this.persistData().catch((error: unknown) => {
+        console.error("Office Reader could not repair plugin data", error);
+      });
     }
   }
 
@@ -300,12 +348,29 @@ export default class WordReaderPlugin extends Plugin {
     this.scheduleDataSave();
   }
 
+  captureFileRevision(
+    file: ReaderFileDescriptor,
+    format: ReaderFormat,
+  ): ReaderFileRevision {
+    return this.fileRevisions.capture(file, format);
+  }
+
+  isFileRevisionCurrent(
+    revision: ReaderFileRevision | null,
+    file: ReaderFileDescriptor | null,
+    format: ReaderFormat,
+  ): boolean {
+    return this.fileRevisions.isCurrent(revision, file, format);
+  }
+
   async flushData(): Promise<void> {
     if (this.dataSaveTimer !== null) {
       window.clearTimeout(this.dataSaveTimer);
       this.dataSaveTimer = null;
     }
-    await this.persistData();
+    await this.persistData().catch((error: unknown) => {
+      console.error("Office Reader could not save plugin data", error);
+    });
   }
 
   private registerReaderCommand(
@@ -323,7 +388,9 @@ export default class WordReaderPlugin extends Plugin {
           return false;
         }
         if (!checking) {
-          void run(session);
+          void Promise.resolve(run(session)).catch((error: unknown) => {
+            console.error("Office Reader command failed", error);
+          });
         }
         return true;
       },
@@ -359,59 +426,68 @@ export default class WordReaderPlugin extends Plugin {
       });
     return this.dataSavePromise;
   }
-}
 
-function getReadingStateData(data: unknown): unknown {
-  if (typeof data !== "object" || data === null) {
-    return undefined;
+  private notifyReaderFileChange(
+    change: ReaderFileChange,
+    markChanged = true,
+  ): void {
+    if (markChanged) {
+      this.fileRevisions.markChanged(change.path);
+    }
+    if (this.readingStates.invalidate(change.path)) {
+      this.scheduleDataSave();
+    }
+    for (const session of this.getReaderSessions()) {
+      try {
+        session.handleFileChange?.(change);
+      } catch (error) {
+        console.error("Office Reader could not invalidate a changed file", error);
+      }
+    }
   }
-  return (data as Record<string, unknown>).readingStates;
-}
 
-function hasCurrentSettingsSchema(data: unknown): boolean {
-  if (typeof data !== "object" || data === null) {
-    return false;
+  private recoverWorkspaceViews(): void {
+    const sessions = this.getReaderSessions();
+    const entries: ReaderWorkspaceEntry[] = sessions.map((session, index) => {
+      const file = session.file;
+      const currentFile = file
+        ? this.app.vault.getAbstractFileByPath(file.path)
+        : null;
+      const availableFile = currentFile instanceof TFile ? currentFile : null;
+      return {
+        id: String(index),
+        format: session.adapter.format,
+        path: availableFile?.path ?? null,
+        extension: availableFile?.extension ?? file?.extension ?? null,
+      };
+    });
+    for (const action of planReaderWorkspaceRecovery(entries)) {
+      if (!action.reason) {
+        continue;
+      }
+      try {
+        sessions[Number(action.id)]?.handleWorkspaceRecovery?.(action.reason);
+      } catch (error) {
+        console.error("Office Reader could not recover a workspace view", error);
+      }
+    }
   }
-  const source = data as Record<string, unknown>;
-  const settingsAreCurrent =
-    source.schemaVersion === DEFAULT_OFFICE_READER_SETTINGS.schemaVersion &&
-    typeof source.common === "object" &&
-    source.common !== null &&
-    typeof source.docx === "object" &&
-    source.docx !== null &&
-    typeof source.pptx === "object" &&
-    source.pptx !== null &&
-    typeof source.xlsx === "object" &&
-    source.xlsx !== null;
-  if (!settingsAreCurrent) {
-    return false;
-  }
-  const readingStates = source.readingStates;
-  return (
-    readingStates === undefined ||
-    (
-      Array.isArray(readingStates) &&
-      readingStates.every(isCurrentReadingStateEntry)
-    )
-  );
-}
 
-function isCurrentReadingStateEntry(value: unknown): boolean {
-  if (typeof value !== "object" || value === null) {
-    return false;
+  private getReaderSessions(): ReaderSession[] {
+    const sessions: ReaderSession[] = [];
+    for (const viewType of [
+      VIEW_TYPE_WORD_READER,
+      VIEW_TYPE_PPTX_READER,
+      VIEW_TYPE_XLSX_READER,
+    ]) {
+      for (const leaf of this.app.workspace.getLeavesOfType(viewType)) {
+        if (isReaderSession(leaf.view)) {
+          sessions.push(leaf.view);
+        }
+      }
+    }
+    return sessions;
   }
-  const entry = value as Record<string, unknown>;
-  return (
-    typeof entry.path === "string" &&
-    typeof entry.mtime === "number" &&
-    typeof entry.format === "string" &&
-    typeof entry.position === "object" &&
-    entry.position !== null &&
-    typeof entry.zoom === "object" &&
-    entry.zoom !== null &&
-    typeof entry.navigation === "object" &&
-    entry.navigation !== null
-  );
 }
 
 function toReaderIdentity(

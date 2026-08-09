@@ -99,9 +99,17 @@ async function getBundledPackageNames() {
   const result = await build({
     entryPoints: [path.join(rootDir, "src", "main.ts")],
     bundle: true,
-    alias: {
-      jszip: "jszip/lib/index.js",
-    },
+    plugins: [{
+      name: "read-only-zip-audit",
+      setup(context) {
+        context.onResolve({ filter: /^jszip$/ }, () => ({
+          path: path.join(rootDir, "src", "ooxml", "jszipReader.ts"),
+        }));
+        context.onResolve({ filter: /^pako$/ }, () => ({
+          path: path.join(rootDir, "node_modules", "pako", "lib", "inflate.js"),
+        }));
+      },
+    }],
     external: [
       "obsidian",
       "electron",

@@ -92,6 +92,24 @@ void test("mtime changes preserve zoom but invalidate position and navigation", 
   assert.deepEqual(restored?.collapsedOutlineIds, []);
 });
 
+void test("same-stat replacement explicitly invalidates reading position", () => {
+  const store = new ReadingStateStore();
+  const identity = {
+    path: "same-stat.xlsx",
+    mtime: 100,
+    format: "xlsx" as const,
+  };
+  store.set(identity, { ...state, page: 7 });
+
+  assert.equal(store.invalidate(identity.path), true);
+  const restored = store.get(identity);
+  assert.equal(restored?.zoom, state.zoom);
+  assert.equal(restored?.fitWidth, state.fitWidth);
+  assert.equal(restored?.scrollTop, 0);
+  assert.equal(restored?.page, undefined);
+  assert.equal(store.invalidate("missing.docx"), false);
+});
+
 void test("legacy states adopt their first known mtime without losing position", () => {
   const store = new ReadingStateStore(100, [
     {

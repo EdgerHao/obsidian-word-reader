@@ -6,6 +6,7 @@ import {
   type ReaderCapability,
 } from "./capabilities";
 import type { ReaderStatus } from "./status";
+import type { ReaderRecoveryText } from "./recovery";
 
 export interface OfficeReaderShellLayout {
   rootEl: HTMLElement;
@@ -124,6 +125,27 @@ export class OfficeReaderShell {
       cls: "office-reader-diagnostics-details",
       text: error.details,
     });
+    return messageEl;
+  }
+
+  renderRecoveryError(
+    parentEl: HTMLElement,
+    recovery: ReaderRecoveryText,
+    onReload: () => void,
+  ): HTMLElement {
+    const messageEl = this.renderError(parentEl, {
+      title: recovery.title,
+      body: recovery.body,
+      tips: [],
+      detailsLabel: recovery.status,
+      details: recovery.details,
+    });
+    const reloadButtonEl = messageEl.createEl("button", {
+      cls: "mod-cta",
+      text: recovery.reload,
+      attr: { type: "button" },
+    });
+    reloadButtonEl.addEventListener("click", onReload);
     return messageEl;
   }
 }
