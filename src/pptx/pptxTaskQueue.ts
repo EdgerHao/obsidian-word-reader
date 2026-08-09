@@ -15,11 +15,17 @@ export class PptxTaskQueue {
   private readonly active = new Map<number, QueueEntry>();
   private sequence = 0;
   private paused = false;
+  private concurrencyLimit: number;
 
-  constructor(readonly concurrency = 2) {
+  constructor(concurrency = 2) {
     if (!Number.isInteger(concurrency) || concurrency < 1) {
       throw new RangeError("Task queue concurrency must be a positive integer.");
     }
+    this.concurrencyLimit = concurrency;
+  }
+
+  get concurrency(): number {
+    return this.concurrencyLimit;
   }
 
   get activeCount(): number {
@@ -75,6 +81,19 @@ export class PptxTaskQueue {
     }
   }
 
+  setConcurrency(concurrency: number, cancelActive = false): void {
+    if (!Number.isInteger(concurrency) || concurrency < 0) {
+      throw new RangeError("Task queue concurrency cannot be negative.");
+    }
+    this.concurrencyLimit = concurrency;
+    if (cancelActive && concurrency === 0) {
+      for (const entry of this.active.values()) {
+        entry.cancelled = true;
+      }
+    }
+    this.pump();
+  }
+
   clear(): void {
     for (const entry of this.queued.values()) {
       entry.cancelled = true;
@@ -88,7 +107,7 @@ export class PptxTaskQueue {
   private pump(): void {
     while (
       !this.paused &&
-      this.active.size < this.concurrency &&
+      this.active.size < this.concurrencyLimit &&
       this.queued.size > 0
     ) {
       const next = [...this.queued.values()].sort(

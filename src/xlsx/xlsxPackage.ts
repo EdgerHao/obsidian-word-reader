@@ -72,6 +72,14 @@ export interface XlsxLoadOptions {
 export interface XlsxWorksheetLoadOptions {
   isCancelled?: () => boolean;
   onProgress?: (percent: number) => void;
+  onWorkSlice?: (durationMs: number) => void;
+  onYield?: () => void;
+  timeSliceMs?: number;
+  yieldControl?: () => Promise<void>;
+}
+
+interface StreamZipTextOptions extends XlsxWorksheetLoadOptions {
+  onChunk: (chunk: string) => void;
 }
 
 export class XlsxPackageError extends Error {
@@ -285,13 +293,23 @@ export class XlsxPackage {
     this.sharedStringsPromise = null;
   }
 
+  reduceMemoryPressure(activeWorksheetIndex: number): void {
+    const activeWorksheet = this.worksheetCache.get(activeWorksheetIndex);
+    this.worksheetCache.clear();
+    if (activeWorksheet) {
+      void this.worksheetCache.set(activeWorksheetIndex, activeWorksheet);
+    }
+    this.imageCache.clear();
+    this.sharedStringsPromise = null;
+  }
+
   private async readWorksheet(
     descriptor: XlsxSheetDescriptor,
     options: XlsxWorksheetLoadOptions,
   ): Promise<XlsxWorksheet> {
     checkCancelled(options.isCancelled);
     const [sharedStrings, relationships] = await Promise.all([
-      this.getSharedStrings(options.isCancelled),
+      this.getSharedStrings(options),
       readRelationships(this.zip, descriptor.path),
     ]);
     checkCancelled(options.isCancelled);
@@ -315,9 +333,18 @@ export class XlsxPackage {
     }
     await streamZipText(
       worksheetEntry,
-      (chunk) => parser.push(chunk),
-      options.isCancelled,
-      options.onProgress,
+      {
+        ...options,
+        onChunk: (chunk) => parser.push(chunk),
+        onWorkSlice: (durationMs) => {
+          parser.recordWorkSlice(durationMs);
+          options.onWorkSlice?.(durationMs);
+        },
+        onYield: () => {
+          parser.recordYield();
+          options.onYield?.();
+        },
+      },
     );
     const metadataXml = parser.completeInput();
     const drawings = await this.readWorksheetDrawings(
@@ -340,7 +367,7 @@ export class XlsxPackage {
   }
 
   private getSharedStrings(
-    isCancelled?: () => boolean,
+    options: XlsxWorksheetLoadOptions,
   ): Promise<readonly string[]> {
     if (!this.sharedStringsPath) {
       return Promise.resolve([]);
@@ -361,9 +388,11 @@ export class XlsxPackage {
     const parser = new XlsxSharedStringsStreamParser(path);
     const pending = streamZipText(
       entry,
-      (chunk) => parser.push(chunk),
-      isCancelled,
-      undefined,
+      {
+        ...options,
+        onProgress: undefined,
+        onChunk: (chunk) => parser.push(chunk),
+      },
     ).then(() => parser.finish());
     this.sharedStringsPromise = pending;
     void pending.catch(() => {
@@ -791,23 +820,27 @@ async function readZipText(zip: JSZip, path: string): Promise<string> {
 
 async function streamZipText(
   entry: JSZip.JSZipObject,
-  onChunk: (chunk: string) => void,
-  isCancelled: (() => boolean) | undefined,
-  onProgress: ((percent: number) => void) | undefined,
+  options: StreamZipTextOptions,
 ): Promise<void> {
+  const timeSliceMs = Math.max(1, options.timeSliceMs ?? 8);
   const streamable = entry as JSZip.JSZipObject & {
     internalStream(
       type: "string",
     ): JSZip.JSZipStreamHelper<string>;
   };
   if (typeof streamable.internalStream !== "function") {
-    onChunk(await entry.async("string"));
-    onProgress?.(100);
+    const startedAt = performance.now();
+    options.onChunk(await entry.async("string"));
+    options.onWorkSlice?.(performance.now() - startedAt);
+    options.onProgress?.(100);
     return;
   }
   await new Promise<void>((resolve, reject) => {
     const stream = streamable.internalStream("string");
     let settled = false;
+    let ended = false;
+    let sliceStartedAt = performance.now();
+    let pending = Promise.resolve();
     const rejectOnce = (error: unknown): void => {
       if (settled) {
         return;
@@ -820,24 +853,64 @@ async function streamZipText(
       if (settled) {
         return;
       }
-      try {
-        checkCancelled(isCancelled);
-        onChunk(chunk);
-        onProgress?.(metadata.percent);
-      } catch (error) {
-        rejectOnce(error);
-      }
+      stream.pause();
+      pending = pending.then(async () => {
+        let offset = 0;
+        while (offset < chunk.length) {
+          const end = findXmlSliceEnd(chunk, offset, 4_096);
+          checkCancelled(options.isCancelled);
+          options.onChunk(chunk.slice(offset, end));
+          offset = end;
+          const elapsed = performance.now() - sliceStartedAt;
+          options.onWorkSlice?.(elapsed);
+          if (options.yieldControl && elapsed >= timeSliceMs) {
+            await options.yieldControl();
+            options.onYield?.();
+            checkCancelled(options.isCancelled);
+            sliceStartedAt = performance.now();
+          }
+        }
+        options.onProgress?.(metadata.percent);
+        if (!settled) {
+          stream.resume();
+        }
+      });
+      void pending.catch(rejectOnce);
     });
     stream.on("error", rejectOnce);
     stream.on("end", () => {
-      if (!settled) {
-        settled = true;
-        onProgress?.(100);
-        resolve();
+      if (settled || ended) {
+        return;
       }
+      ended = true;
+      void pending.then(() => {
+        if (!settled) {
+          settled = true;
+          options.onProgress?.(100);
+          resolve();
+        }
+      }).catch(rejectOnce);
     });
     stream.resume();
   });
+}
+
+function findXmlSliceEnd(
+  source: string,
+  offset: number,
+  targetLength: number,
+): number {
+  const target = Math.min(source.length, offset + targetLength);
+  if (target === source.length) {
+    return target;
+  }
+  const lastOpen = source.lastIndexOf("<", target - 1);
+  const lastClose = source.lastIndexOf(">", target - 1);
+  if (lastOpen > lastClose) {
+    const nextClose = source.indexOf(">", target);
+    return nextClose < 0 ? source.length : nextClose + 1;
+  }
+  return target;
 }
 
 function parsePackageXml(xml: string, path: string): Document {

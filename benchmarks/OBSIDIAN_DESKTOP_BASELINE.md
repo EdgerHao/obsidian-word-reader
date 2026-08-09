@@ -27,8 +27,11 @@ issues or CI artifacts.
 2. For each format, run at least five cold opens. Capture plugin activation,
    package/parse work, first readable content, search, navigation, and a
    representative continuous scroll. Report median and p95.
-3. Record long tasks (`>= 50 ms`), peak used JavaScript heap, and the maximum
-   actual node count under the reader root. Do not export a heap snapshot.
+3. Record long tasks (`>= 50 ms`), maximum cooperative work slice, yield and
+   background-preemption counts, memory-pressure level, peak used JavaScript
+   heap, and the maximum actual node count under the reader root. Record an
+   unavoidable browser/third-party phase separately. Do not export a heap
+   snapshot.
 4. Close the file, wait two animation frames, and record Blob URLs, format
    cache entries, queued/background work, observers, timers, listeners, and
    reader DOM nodes that remain.
@@ -38,11 +41,11 @@ issues or CI artifacts.
 
 ## Results
 
-| Format | Activation median / p95 | First readable median / p95 | Parse median / p95 | Search median / p95 | Navigation median / p95 | Scroll frame p95 | Long tasks / max | Peak heap | Max actual DOM | Cache / limit | Resources after close | Cleanup passed |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| DOCX | | | | | | | | | | | | |
-| PPTX | | | | | | | | | | | | |
-| XLSX | | | | | | | | | | | | |
+| Format | Activation median / p95 | First readable median / p95 | Parse median / p95 | Search median / p95 | Navigation median / p95 | Scroll frame p95 | Long tasks / max work slice | Yields / preemptions | Memory pressure | Uninterruptible phase / max | Peak heap | Max actual DOM | Cache / limit | Resources after close | Cleanup passed |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| DOCX | | | | | | | | | | | | | | | |
+| PPTX | | | | | | | | | | | | | | | |
+| XLSX | | | | | | | | | | | | | | | |
 
 ## Safe diagnostic check
 

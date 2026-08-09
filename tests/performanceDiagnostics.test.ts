@@ -18,6 +18,10 @@ void test("performance diagnostics use one privacy-safe schema for every format"
     tracker.recordScrollFrame(7);
     tracker.recordCancellation(true);
     tracker.recordCleanup(true);
+    tracker.recordWorkSlice(8.125);
+    tracker.recordYield(3);
+    tracker.recordBackgroundPreemption();
+    tracker.recordMemoryPressure("elevated");
     const report = createReaderPerformanceDiagnosticReport(
       format,
       {
@@ -39,6 +43,14 @@ void test("performance diagnostics use one privacy-safe schema for every format"
     assert.equal(report.details.measurement, "obsidian-desktop-runtime");
     assert.equal(report.details.timings.packageLoadMs, 12.35);
     assert.equal(report.details.timings.scrollFrameP95Ms, 7);
+    assert.deepEqual(report.details.responsiveness, {
+      maximumWorkSliceMs: 8.13,
+      longTaskCount: 0,
+      yieldCount: 3,
+      backgroundPreemptions: 1,
+      memoryPressure: "elevated",
+      uninterruptiblePhase: null,
+    });
     assert.deepEqual(report.details.privacy, {
       containsDocumentContent: false,
       containsSpeakerNotes: false,

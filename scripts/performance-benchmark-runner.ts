@@ -14,6 +14,7 @@ import {
 import { PptxSearchIndex } from "../src/pptx/pptxMetadata";
 import { PptxNavigationWindow } from "../src/pptx/pptxNavigationWindow";
 import { ReaderLifecycle } from "../src/reader/lifecycle";
+import { runCooperativeWork } from "../src/reader/cooperativeWork";
 import { XlsxPackage } from "../src/xlsx/xlsxPackage";
 import { searchXlsxWorkbook } from "../src/xlsx/xlsxSearch";
 import { XlsxVirtualGrid } from "../src/xlsx/xlsxVirtualGrid";
@@ -24,10 +25,12 @@ import {
 } from "../tests/performanceFixtures";
 import {
   createLargeDenseXlsx,
+  createLargeSparseXlsx,
   createRichXlsx,
 } from "../tests/xlsxFixture";
 
 type BenchmarkFormat = "docx" | "pptx" | "xlsx";
+type BenchmarkProfile = "ci" | "extended";
 
 interface BenchmarkSample {
   format: BenchmarkFormat;
@@ -44,16 +47,17 @@ void main().catch((error: unknown) => {
 
 async function main(): Promise<void> {
   const format = process.argv[2];
+  const profile = parseProfile(process.argv[3]);
   let sample: BenchmarkSample;
   switch (format) {
     case "docx":
-      sample = await benchmarkDocx();
+      sample = await benchmarkDocx(profile);
       break;
     case "pptx":
-      sample = await benchmarkPptx();
+      sample = await benchmarkPptx(profile);
       break;
     case "xlsx":
-      sample = await benchmarkXlsx();
+      sample = await benchmarkXlsx(profile);
       break;
     default:
       throw new Error(`Unknown performance benchmark format: ${format ?? ""}`);
@@ -61,8 +65,11 @@ async function main(): Promise<void> {
   console.log(`OFFICE_READER_BENCHMARK_JSON=${JSON.stringify(sample)}`);
 }
 
-async function benchmarkDocx(): Promise<BenchmarkSample> {
-  const buffer = await createLargeDocx(100);
+async function benchmarkDocx(
+  profile: BenchmarkProfile,
+): Promise<BenchmarkSample> {
+  const pageCount = profile === "extended" ? 500 : 100;
+  const buffer = await createLargeDocx(pageCount);
   const heap = createHeapSampler();
 
   const packageLoadStartedAt = performance.now();
@@ -95,7 +102,7 @@ async function benchmarkDocx(): Promise<BenchmarkSample> {
   heap.sample();
 
   const searchStartedAt = performance.now();
-  const normalizedQuery = "performance page 100";
+  const normalizedQuery = `performance page ${pageCount}`;
   const searchMatches = textRuns.filter((value) =>
     value.toLocaleLowerCase().includes(normalizedQuery),
   ).length;
@@ -103,9 +110,25 @@ async function benchmarkDocx(): Promise<BenchmarkSample> {
 
   const navigationStartedAt = performance.now();
   const navigationTarget = paragraphs.findIndex((paragraph) =>
-    (paragraph.textContent ?? "").includes("Performance page 100"),
+    (paragraph.textContent ?? "").includes(`Performance page ${pageCount}`),
   );
   const navigationMs = performance.now() - navigationStartedAt;
+
+  const committedPages: string[] = [];
+  const commitDiagnostics = await runCooperativeWork(
+    paragraphs.length,
+    (start, end) => {
+      for (const paragraph of paragraphs.slice(start, end)) {
+        committedPages.push(paragraph.textContent ?? "");
+      }
+    },
+    {
+      initialBatchSize: 1,
+      maximumBatchSize: 16,
+      timeSliceMs: 8,
+      yieldControl: yieldToNode,
+    },
+  );
 
   const scrollFrames: number[] = [];
   const pageHeight = 1_056;
@@ -133,7 +156,7 @@ async function benchmarkDocx(): Promise<BenchmarkSample> {
 
   return {
     format: "docx",
-    fixture: "generated-100-page-docx",
+    fixture: `generated-${pageCount}-page-docx`,
     metrics: {
       packageLoadMs: round(packageLoadMs),
       parseMs: round(parseMs),
@@ -148,13 +171,21 @@ async function benchmarkDocx(): Promise<BenchmarkSample> {
       cacheAfterCleanup: 0,
       contentUnits: paragraphs.length,
       searchMatches,
+      maximumWorkSliceMs: round(commitDiagnostics.maximumWorkSliceMs),
+      yieldCount: commitDiagnostics.yieldCount,
     },
     checks: {
       firstReadablePassed: firstReadableText === "Performance page 1",
-      navigationPassed: navigationTarget === 99 && visiblePage === 99,
+      navigationPassed:
+        navigationTarget === pageCount - 1 && visiblePage === pageCount - 1,
       cacheWithinLimit: true,
       cancellationPassed,
       cleanupPassed: zip === null && document === null,
+      outputConsistencyPassed:
+        committedPages.length === paragraphs.length &&
+        committedPages.at(-1)?.includes(`Performance page ${pageCount}`) ===
+          true,
+      responseBudgetPassed: commitDiagnostics.maximumWorkSliceMs < 50,
     },
     context: {
       domMeasurement: "parsed-structural-nodes",
@@ -163,8 +194,11 @@ async function benchmarkDocx(): Promise<BenchmarkSample> {
   };
 }
 
-async function benchmarkPptx(): Promise<BenchmarkSample> {
-  const buffer = await createLargePptx(1_000);
+async function benchmarkPptx(
+  profile: BenchmarkProfile,
+): Promise<BenchmarkSample> {
+  const slideCount = profile === "extended" ? 2_000 : 1_000;
+  const buffer = await createLargePptx(slideCount);
   const heap = createHeapSampler();
 
   const packageLoadStartedAt = performance.now();
@@ -179,22 +213,38 @@ async function benchmarkPptx(): Promise<BenchmarkSample> {
   heap.sample();
 
   const parseStartedAt = performance.now();
+  let maximumWorkSliceMs = 0;
+  let yieldCount = 0;
   const metadata = await presentation.indexSlideMetadata({
     concurrency: 4,
-    priorityIndex: 500,
+    batchSize: 8,
+    priorityIndex: Math.floor(slideCount / 2),
+    yieldControl: yieldToNode,
+    onWorkSlice: (durationMs) => {
+      maximumWorkSliceMs = Math.max(maximumWorkSliceMs, durationMs);
+    },
+    onYield: () => {
+      yieldCount += 1;
+    },
   });
   const parseMs = performance.now() - parseStartedAt;
   heap.sample();
 
   const searchIndex = new PptxSearchIndex(metadata);
   const searchStartedAt = performance.now();
-  const searchMatches = searchIndex.search("performance slide 1000").length;
+  const searchMatches = searchIndex.search(
+    `performance slide ${slideCount}`,
+  ).length;
   const searchMs = performance.now() - searchStartedAt;
 
   const indices = metadata.map((slide) => slide.index);
   const navigationWindow = new PptxNavigationWindow(196, 4, 60);
   const navigationStartedAt = performance.now();
-  const navigationTop = navigationWindow.scrollTopForIndex(indices, 999);
+  const finalSlideIndex = slideCount - 1;
+  const navigationTop = navigationWindow.scrollTopForIndex(
+    indices,
+    finalSlideIndex,
+  );
   const navigationResult = navigationWindow.calculate(
     indices,
     navigationTop ?? 0,
@@ -246,7 +296,7 @@ async function benchmarkPptx(): Promise<BenchmarkSample> {
 
   return {
     format: "pptx",
-    fixture: "generated-1000-slide-pptx",
+    fixture: `generated-${slideCount}-slide-pptx`,
     metrics: {
       packageLoadMs: round(packageLoadMs),
       parseMs: round(parseMs),
@@ -261,13 +311,20 @@ async function benchmarkPptx(): Promise<BenchmarkSample> {
       cacheAfterCleanup,
       contentUnits: presentation.slideCount,
       searchMatches,
+      maximumWorkSliceMs: round(maximumWorkSliceMs),
+      yieldCount,
     },
     checks: {
       firstReadablePassed: firstMetadata.title === "Performance slide 1",
-      navigationPassed: navigationResult.indices.includes(999),
+      navigationPassed: navigationResult.indices.includes(finalSlideIndex),
       cacheWithinLimit: cacheEntries <= cacheLimit,
       cancellationPassed,
       cleanupPassed: cacheAfterCleanup === 0,
+      outputConsistencyPassed:
+        metadata.length === presentation.slideCount &&
+        metadata[finalSlideIndex]?.title ===
+          `Performance slide ${slideCount}`,
+      responseBudgetPassed: maximumWorkSliceMs < 50,
     },
     context: {
       domMeasurement: "current-slide-structural-plus-mounted-navigation-estimate",
@@ -276,8 +333,15 @@ async function benchmarkPptx(): Promise<BenchmarkSample> {
   };
 }
 
-async function benchmarkXlsx(): Promise<BenchmarkSample> {
-  const buffer = await createRichXlsx();
+async function benchmarkXlsx(
+  profile: BenchmarkProfile,
+): Promise<BenchmarkSample> {
+  const sparseRows = profile === "extended" ? 1_048_576 : 100_000;
+  const denseRows = profile === "extended" ? 50_000 : 20_000;
+  const denseColumns = profile === "extended" ? 8 : 4;
+  const buffer = profile === "extended"
+    ? await createLargeSparseXlsx(sparseRows)
+    : await createRichXlsx();
   const heap = createHeapSampler();
 
   const packageLoadStartedAt = performance.now();
@@ -286,7 +350,10 @@ async function benchmarkXlsx(): Promise<BenchmarkSample> {
   heap.sample();
 
   const firstReadableStartedAt = performance.now();
-  const worksheet = await workbook.getWorksheet(0);
+  const worksheet = await workbook.getWorksheet(0, {
+    timeSliceMs: 8,
+    yieldControl: yieldToNode,
+  });
   const grid = new XlsxVirtualGrid(worksheet);
   const firstWindow = grid.calculate({
     scrollTop: 0,
@@ -345,14 +412,17 @@ async function benchmarkXlsx(): Promise<BenchmarkSample> {
   }
   cancellationWorkbook.clearCaches();
 
-  const denseBuffer = await createLargeDenseXlsx();
+  const denseBuffer = await createLargeDenseXlsx(denseRows, denseColumns);
   runGarbageCollection();
   const denseBaselineHeap = process.memoryUsage().heapUsed;
   let densePeakHeap = denseBaselineHeap;
   const denseParseStartedAt = performance.now();
   const denseWorkbook = await XlsxPackage.load(denseBuffer);
   densePeakHeap = Math.max(densePeakHeap, process.memoryUsage().heapUsed);
-  const denseWorksheet = await denseWorkbook.getWorksheet(0);
+  const denseWorksheet = await denseWorkbook.getWorksheet(0, {
+    timeSliceMs: 8,
+    yieldControl: yieldToNode,
+  });
   densePeakHeap = Math.max(densePeakHeap, process.memoryUsage().heapUsed);
   const denseParseMs = performance.now() - denseParseStartedAt;
   const denseCache = denseWorkbook.getCacheDiagnostics();
@@ -368,7 +438,9 @@ async function benchmarkXlsx(): Promise<BenchmarkSample> {
 
   return {
     format: "xlsx",
-    fixture: "generated-100000-row-sparse-and-20000-row-dense-xlsx",
+    fixture:
+      `generated-${sparseRows}-row-sparse-and-${denseRows}-row-` +
+      `${denseColumns}-column-dense-xlsx`,
     metrics: {
       packageLoadMs: round(packageLoadMs),
       parseMs: round(parseMs),
@@ -394,6 +466,13 @@ async function benchmarkXlsx(): Promise<BenchmarkSample> {
         denseWorksheet.parseDiagnostics.maximumSheetDataBufferCharacters / 1024,
       ),
       denseCacheEntries: denseCache.worksheets + denseCache.images,
+      maximumWorkSliceMs: round(Math.max(
+        worksheet.parseDiagnostics.maximumWorkSliceMs,
+        denseWorksheet.parseDiagnostics.maximumWorkSliceMs,
+      )),
+      yieldCount:
+        worksheet.parseDiagnostics.yieldCount +
+        denseWorksheet.parseDiagnostics.yieldCount,
     },
     checks: {
       firstReadablePassed: Boolean(worksheet.getCell(0, 0)),
@@ -407,12 +486,28 @@ async function benchmarkXlsx(): Promise<BenchmarkSample> {
         denseWorksheet.parseDiagnostics.inputChunks > 1 &&
         denseWorksheet.parseDiagnostics.maximumSheetDataBufferCharacters <
           256 * 1024,
+      outputConsistencyPassed:
+        worksheet.rowCount === sparseRows &&
+        denseWorksheet.rowCount === denseRows &&
+        denseWorksheet.populatedCellCount === denseRows * denseColumns,
+      responseBudgetPassed:
+        denseWorksheet.parseDiagnostics.maximumWorkSliceMs < 50,
     },
     context: {
       domMeasurement: "virtual-grid-estimated-mounted-nodes",
       cacheMeasurement: "worksheet-and-image-lru-caches",
     },
   };
+}
+
+function parseProfile(value: string | undefined): BenchmarkProfile {
+  if (value === undefined || value === "ci") {
+    return "ci";
+  }
+  if (value === "extended") {
+    return value;
+  }
+  throw new Error(`Unknown performance benchmark profile: ${value}`);
 }
 
 function createHeapSampler(): {
@@ -469,6 +564,10 @@ function percentile(values: readonly number[], quantile: number): number {
 function runGarbageCollection(): void {
   const runtime = globalThis as typeof globalThis & { gc?: () => void };
   runtime.gc?.();
+}
+
+function yieldToNode(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 function round(value: number): number {

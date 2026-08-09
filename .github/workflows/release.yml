@@ -45,6 +45,26 @@ jobs:
       - name: Performance budget
         run: npm run performance:check
 
+      - name: Extended large-file budget
+        run: npm run large-files:extended
+
+      - name: Add extended large-file summary
+        if: ${{ always() && hashFiles('benchmark-results/large-files-summary.md') != '' }}
+        shell: bash
+        run: cat benchmark-results/large-files-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload extended large-file trend point
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: office-reader-release-large-files-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            benchmark-results/large-files.latest.json
+            benchmark-results/large-files-trend.json
+            benchmark-results/large-files-summary.md
+          if-no-files-found: warn
+          retention-days: 90
+
       - name: Lifecycle stress
         run: npm run lifecycle:check
 

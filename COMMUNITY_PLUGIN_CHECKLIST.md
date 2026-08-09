@@ -13,6 +13,9 @@ Community directory and before publishing later releases.
 - [ ] Confirm `npm run performance:check` passes DOCX, PPTX, and XLSX budgets,
   reports `dist/main.js` at or below 500 KiB and the release zip at or below
   8 MiB, and writes the machine-readable CI trend artifacts.
+- [ ] Confirm `npm run large-files:extended` passes 500-page DOCX, 2,000-slide
+  PPTX, Excel-row-limit sparse XLSX, and 50,000-row/400,000-cell dense XLSX
+  budgets and writes its result, trend, and summary artifacts.
 - [ ] Confirm `npm run lifecycle:check` completes four 100-cycle sequences and
   the 300-attempt recovery matrix with zero resource residue, stale UI commits,
   sustained heap growth, or unhandled Promise rejections.
@@ -68,7 +71,8 @@ Community directory and before publishing later releases.
 - [ ] Confirm conditional formatting is bounded to literal numeric `cellIs`,
   two-/three-color scales, and data bars, with at most 256 rules per sheet.
 - [ ] Confirm worksheet and shared-string XML parses in cancellable chunks,
-  reports progress, and does not retain complete dense-sheet `sheetData` XML.
+  applies serialized backpressure, reports progress, and does not retain
+  complete dense-sheet `sheetData` XML.
 - [ ] Confirm the 20,000-row/80,000-cell dense benchmark stays within the
   elapsed-time, peak-heap, XML-buffer, and virtual-grid budgets.
 - [ ] Confirm the XLSX grid mounts no more than 2,500 cells plus bounded
@@ -96,6 +100,12 @@ Community directory and before publishing later releases.
   entries, with a fixed upper bound on concurrent previews.
 - [ ] Confirm 1,000-slide navigation mounts at most 60 rows, metadata parsing
   uses at most four workers, and thumbnail rendering uses at most two workers.
+- [ ] Confirm foreground navigation preempts background metadata, thumbnails,
+  and preload; critical heap/package/image/DOM/cache pressure stops preload,
+  lowers concurrency, and releases inactive caches.
+- [ ] Confirm privacy-safe performance diagnostics report maximum work slice,
+  long-task/yield/preemption counts, memory pressure, and any uninterruptible
+  third-party DOCX render phase without document content or vault paths.
 - [ ] Confirm DOCX search reuses its render-time index without inserting
   highlight elements into document content.
 - [ ] Confirm presentation Blob URLs are released after thumbnail unmount,

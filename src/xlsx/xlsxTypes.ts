@@ -232,6 +232,8 @@ export interface XlsxPackageDiagnostics {
 export interface XlsxWorksheetParseDiagnostics {
   mode: "streamed";
   inputChunks: number;
+  yieldCount: number;
+  maximumWorkSliceMs: number;
   maximumSheetDataBufferCharacters: number;
   metadataCharacters: number;
 }

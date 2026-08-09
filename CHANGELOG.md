@@ -1,5 +1,71 @@
 # Changelog
 
+## 3.5.0 - 2026-08-09
+
+### English
+
+#### Added
+
+- Added cooperative-work and memory-pressure policies shared by DOCX, PPTX,
+  and XLSX, including foreground preemption, adaptive batch sizing, bounded
+  concurrency, and critical-pressure preload shutdown.
+- Added privacy-safe responsiveness diagnostics for maximum work slice, long
+  tasks, yields, background preemptions, memory pressure, and the separately
+  identified uninterruptible DOCX third-party render phase.
+- Added a three-process extended large-file gate for 500-page DOCX,
+  2,000-slide PPTX, an Excel-row-limit sparse workbook, and a
+  50,000-row/400,000-cell dense workbook. Scheduled and release workflows
+  retain machine-readable results, trend points, and Markdown summaries.
+
+#### Changed
+
+- DOCX visible DOM is now committed with adaptive batches and browser yields;
+  memory and DOM pressure reduce each batch without changing document order.
+- PPTX metadata indexing now prioritizes slides around the current page,
+  yields after bounded batches, and lets foreground slide rendering preempt
+  background indexing and thumbnail preload. Critical pressure stops preload.
+- XLSX worksheet streams now apply serialized backpressure, parse bounded XML
+  slices, and yield between slices. Critical pressure drops inactive worksheet,
+  shared-string, and image caches before more work is scheduled.
+- Fast CI keeps the 100-page/1,000-slide/100,000-row/80,000-cell fixtures,
+  while both performance tiers enforce a 50 ms maximum cooperative work slice,
+  output consistency, cancellation, cleanup, heap, DOM, cache, and bundle gates.
+
+#### Fixed
+
+- Dense worksheet decompression can no longer enqueue overlapping parser work;
+  stream events are serialized before resume, preserving XML order under
+  cooperative yielding and rapid cancellation.
+
+### 中文
+
+#### 新增
+
+- 增加 DOCX、PPTX、XLSX 共用的协作任务与内存压力策略，覆盖前台抢占、
+  自适应批次、有界并发和临界压力下停止预加载。
+- 增加隐私安全的响应性诊断：最大工作切片、长任务、让出次数、后台抢占、
+  内存压力，以及单独标记的 DOCX 第三方不可中断渲染阶段。
+- 增加三次独立进程的扩展大文件门禁，覆盖 500 页 DOCX、2,000 页 PPTX、
+  Excel 行上限稀疏工作簿和 50,000 行/400,000 单元格稠密工作簿；定时与发布
+  工作流保留机器可读结果、趋势点和 Markdown 摘要。
+
+#### 变更
+
+- DOCX 可见 DOM 改为自适应批次提交并主动让出浏览器；内存和 DOM 压力会
+  缩小批次，但不改变文档顺序。
+- PPTX 元数据索引优先处理当前页附近幻灯片，并在有界批次后让出；前台幻灯片
+  渲染可抢占后台索引与缩略图预加载，达到临界压力时停止预加载。
+- XLSX 工作表流增加串行背压，以有界 XML 片段解析并在片段间让出；临界压力
+  下会先释放非活动工作表、共享字符串和图片缓存，再调度后续工作。
+- 快速 CI 继续使用 100 页/1,000 页/100,000 行/80,000 单元格样本；两级性能
+  门禁同时验证 50 ms 最大协作切片、输出一致性、取消、清理、堆、DOM、缓存
+  和包体积。
+
+#### 修复
+
+- 稠密工作表解压不再产生重叠的解析任务；流事件会在恢复读取前串行完成，
+  在协作让出和快速取消下仍保持 XML 顺序。
+
 ## 3.4.0 - 2026-08-09
 
 ### English

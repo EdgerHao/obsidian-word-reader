@@ -211,8 +211,10 @@ Available settings:
 - Successful DOCX, PPTX, and XLSX previews expose the same JSON performance
   snapshot with package/parse/first-readable/search/navigation/scroll timings,
   peak heap when Chromium exposes it, actual DOM, bounded-cache, retained
-  resource, cancellation, and cleanup observations. Document text, speaker
-  notes, cell values, internal XML, and absolute vault paths are excluded.
+  resource, cancellation, cleanup, maximum work slice, yield/preemption count,
+  and memory-pressure observations. Uninterruptible third-party DOCX rendering
+  is labeled separately. Document text, speaker notes, cell values, internal
+  XML, and absolute vault paths are excluded.
 - Large file warnings include the file size and use the configured threshold from settings.
 
 ## Performance and Stability
@@ -228,6 +230,14 @@ Available settings:
   compact CI trend JSON, and a Markdown summary under `benchmark-results/`.
   CI uploads these artifacts for cross-run comparison. The manual Obsidian
   Desktop calibration worksheet is in `benchmarks/`.
+- `npm run large-files:extended` runs three isolated samples for 500-page
+  DOCX, 2,000-slide PPTX, an Excel-row-limit sparse XLSX, and a
+  50,000-row/400,000-cell dense XLSX. It runs weekly and before release, not on
+  every commit, and writes matching machine-readable trend artifacts.
+- DOCX DOM commit, PPTX metadata/thumbnail work, and XLSX stream parsing share
+  an adaptive 8 ms work-slice policy. Foreground navigation preempts background
+  work; elevated memory pressure lowers batches/concurrency, and critical
+  pressure stops preload and releases inactive caches.
 - A shared reader shell plus `OfficeReaderAdapter`, `ReaderSession`, and
   `ReaderCapabilities` contracts keep toolbars, status, errors, diagnostics,
   and cleanup behavior consistent. DOCX, PPTX, and XLSX rendering logic lives in

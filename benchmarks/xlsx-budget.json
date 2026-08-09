@@ -15,14 +15,16 @@
     "p95.cacheAfterCleanup": 0,
     "p95.denseParseMs": 3000,
     "p95.densePeakHeapMiB": 192,
-    "p95.maximumSheetDataBufferKiB": 256
+    "p95.maximumSheetDataBufferKiB": 256,
+    "p95.maximumWorkSliceMs": 50
   },
   "minimums": {
     "median.contentUnits": 100000,
     "median.searchMatches": 1,
     "median.denseRows": 20000,
     "median.densePopulatedCells": 80000,
-    "median.streamedChunkCount": 2
+    "median.streamedChunkCount": 2,
+    "median.yieldCount": 1
   },
   "requirements": {
     "checks.firstReadablePassed": true,
@@ -30,6 +32,8 @@
     "checks.cacheWithinLimit": true,
     "checks.cancellationPassed": true,
     "checks.cleanupPassed": true,
-    "checks.streamedParsingPassed": true
+    "checks.streamedParsingPassed": true,
+    "checks.outputConsistencyPassed": true,
+    "checks.responseBudgetPassed": true
   }
 }

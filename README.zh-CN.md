@@ -181,9 +181,10 @@ Office Reader 是一个 Obsidian 桌面端插件，用于在 Obsidian 内直接�
 - 复制的诊断信息使用统一、带版本号的 JSON 信封，只包含格式、诊断类型、
   文件名、大小、修改时间、隐私安全摘要和有界的格式指标。原始渲染错误、
   文档正文、内部 XML 和 vault 绝对路径均不会被复制。
-- 成功打开 PPTX 后也可以复制 JSON 渲染诊断，包含文档包大小、幻灯片尺寸、
-  对象数量、生成资源数量、显式字体和渲染耗时；不会包含文档正文、演讲者备注、
-  内部 XML 或 vault 绝对路径。
+- 成功打开 DOCX、PPTX 和 XLSX 后可复制同一结构的 JSON 性能诊断，包含
+  包加载/解析/首屏/搜索/导航/滚动耗时、实际 DOM、有界缓存、保留资源、
+  最大工作切片、让出/抢占次数和内存压力；不可中断的 DOCX 第三方渲染会单独
+  标记。诊断不会包含正文、演讲者备注、单元格值、内部 XML 或 vault 绝对路径。
 - 大文件提醒会显示文件大小，并使用设置中的提醒阈值。
 
 ## 性能与稳定性
@@ -193,6 +194,13 @@ Office Reader 是一个 Obsidian 桌面端插件，用于在 Obsidian 内直接�
   定时器、观察器、监听器、过期 UI 提交、保留堆趋势、可恢复包错误和未处理
   rejection。完整 JSON、精简趋势点和 Markdown 摘要会写入
   `benchmark-results/`，CI 保存 90 天。
+- `npm run performance:check` 以五个独立进程运行快速 CI 样本；
+  `npm run large-files:extended` 以三个独立进程覆盖 500 页 DOCX、2,000 页
+  PPTX、Excel 行上限稀疏 XLSX 和 50,000 行/400,000 单元格稠密 XLSX。
+  扩展门禁每周及发布前运行，不拖慢每次提交，并输出同结构的机器可读趋势产物。
+- DOCX DOM 提交、PPTX 元数据/缩略图任务和 XLSX 流式解析共用自适应 8 ms
+  工作切片策略；前台导航可抢占后台工作，内存压力升高时降低批次与并发，达到
+  临界压力时停止预加载并释放非活动缓存。
 - 共享阅读壳层以及 `OfficeReaderAdapter`、`ReaderSession`、
   `ReaderCapabilities` 契约统一工具栏、状态、错误、诊断与资源清理行为；
   DOCX/PPTX/XLSX 渲染逻辑分别位于格式专属适配器和会话。

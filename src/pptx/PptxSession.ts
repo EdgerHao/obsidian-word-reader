@@ -13,7 +13,10 @@ import {
   createPptxErrorDiagnosticReport,
   formatPptxDiagnosticReport,
 } from "./pptxDiagnostics";
-import { PptxPackage } from "./pptxPackage";
+import {
+  PptxMetadataCancelledError,
+  PptxPackage,
+} from "./pptxPackage";
 import { classifyPptxError } from "./pptxErrors";
 import {
   getPptxReaderText,
@@ -31,6 +34,7 @@ import {
 } from "./pptxRenderer";
 import { PptxTaskQueue } from "./pptxTaskQueue";
 import { ReaderLifecycle } from "../reader/lifecycle";
+import { ReaderWorkCoordinator } from "../reader/cooperativeWork";
 import {
   type ReaderFileChange,
   type ReaderFileRevision,
@@ -56,6 +60,11 @@ import {
   type ReaderRecoveryReason,
 } from "../reader/recovery";
 import { ReaderResourceScope } from "../reader/resourceScope";
+import {
+  evaluateReaderMemoryPressure,
+  readRuntimeHeapBudget,
+  type ReaderMemoryPolicy,
+} from "../reader/memoryPressure";
 import { OfficeReaderShell } from "../reader/shell";
 import type { ReaderWorkspaceRecoveryReason } from "../reader/workspaceRecovery";
 import type { ReaderCapability } from "../reader/capabilities";
@@ -64,6 +73,7 @@ import {
   PPTX_VIEW_TYPE,
   type PptxAdapter,
 } from "./PptxAdapter";
+import { DEFAULT_PPTX_ZIP_LIMITS } from "./zipLimits";
 
 declare const __DEV__: boolean;
 
@@ -135,7 +145,10 @@ export class PptxSession extends FileView implements ReaderSession {
   private readonly navigationEntries = new Map<number, PptxNavigationEntry>();
   private readonly navigationWindow = new PptxNavigationWindow();
   private readonly thumbnailQueue = new PptxTaskQueue(2);
+  private readonly workCoordinator = new ReaderWorkCoordinator();
+  private memoryPolicy: ReaderMemoryPolicy = evaluateReaderMemoryPressure({});
   private navigationRenderFrameId: number | null = null;
+  private finishNavigationForeground: (() => void) | null = null;
   private searchTimer: number | null = null;
   private metadataUiFrameId: number | null = null;
   private currentSlideIndex = 0;
@@ -772,6 +785,7 @@ export class PptxSession extends FileView implements ReaderSession {
   private async loadPresentation(file: TFile): Promise<void> {
     const previousToken = this.loadLifecycle.currentToken;
     this.performanceTracker.reset();
+    this.workCoordinator.resetDiagnostics();
     this.performanceLoadStartedAt = performance.now();
     this.firstReadableRecorded = false;
     this.maximumDomNodes = 0;
@@ -822,13 +836,25 @@ export class PptxSession extends FileView implements ReaderSession {
       this.buildNavigationList();
       this.updateNotes();
       this.updateNavigationControls();
+      this.memoryPolicy = this.updateMemoryPolicy(presentation);
       const metadataStartedAt = performance.now();
       this.metadataPromise = presentation.indexSlideMetadata({
-        concurrency: 4,
+        concurrency: Math.max(
+          1,
+          this.memoryPolicy.backgroundConcurrency,
+        ),
+        batchSize: 8,
         priorityIndex: this.currentSlideIndex,
         isCancelled: () =>
           !this.isLoadCurrent(token) ||
           this.presentation !== presentation,
+        yieldControl: () => this.yieldMetadataWork(token, presentation),
+        onWorkSlice: (durationMs) => {
+          this.performanceTracker.recordWorkSlice(durationMs);
+        },
+        onYield: () => {
+          this.performanceTracker.recordYield();
+        },
         onMetadata: (metadata) => {
           this.slideMetadata[metadata.index] = metadata;
           this.loadedMetadataIndices.add(metadata.index);
@@ -917,6 +943,7 @@ export class PptxSession extends FileView implements ReaderSession {
     }
 
     const token = this.slideLifecycle.begin();
+    const finishForeground = this.workCoordinator.beginForeground();
     const index = this.currentSlideIndex;
     this.thumbnailQueue.setPaused(true, true);
     this.clearCanvas();
@@ -966,6 +993,10 @@ export class PptxSession extends FileView implements ReaderSession {
       this.renderedWidth = rendered.width;
       this.renderedHeight = rendered.height;
       this.currentRenderDiagnostics = rendered.diagnostics;
+      this.performanceTracker.recordWorkSlice(
+        rendered.diagnostics.maxWorkSliceMs,
+      );
+      this.performanceTracker.recordYield(rendered.diagnostics.yieldCount);
       this.canvasEl.appendChild(rendered.element);
       this.maximumDomNodes = Math.max(
         this.maximumDomNodes,
@@ -1007,6 +1038,7 @@ export class PptxSession extends FileView implements ReaderSession {
         this.showError(error);
       }
     } finally {
+      finishForeground();
       if (!adoptedResources) {
         releaseResources(resources, (resource) => {
           URL.revokeObjectURL(resource);
@@ -1080,15 +1112,24 @@ export class PptxSession extends FileView implements ReaderSession {
       return;
     }
     const renderWindow = this.slideListEl.win;
+    this.finishNavigationForeground = this.workCoordinator.beginForeground();
+    this.thumbnailQueue.setPaused(true);
     this.navigationRenderFrameId = this.sessionResources.requestFrame(
       renderWindow,
       () => {
-      this.navigationRenderFrameId = null;
-      const startedAt = performance.now();
-      this.renderNavigationWindow();
-      this.performanceTracker.recordScrollFrame(
-        performance.now() - startedAt,
-      );
+        this.navigationRenderFrameId = null;
+        const startedAt = performance.now();
+        try {
+          this.renderNavigationWindow();
+          this.performanceTracker.recordScrollFrame(
+            performance.now() - startedAt,
+          );
+        } finally {
+          this.finishNavigationForeground?.();
+          this.finishNavigationForeground = null;
+          this.thumbnailQueue.setPaused(false);
+          this.refreshThumbnailQueue();
+        }
       },
     );
   }
@@ -1237,6 +1278,11 @@ export class PptxSession extends FileView implements ReaderSession {
   private refreshThumbnailQueue(): void {
     const presentation = this.presentation;
     if (!presentation) {
+      return;
+    }
+    this.memoryPolicy = this.updateMemoryPolicy(presentation);
+    if (!this.memoryPolicy.allowPreload) {
+      this.thumbnailQueue.clear();
       return;
     }
     const lifecycleToken = this.thumbnailLifecycle.currentToken;
@@ -1437,9 +1483,23 @@ export class PptxSession extends FileView implements ReaderSession {
     const pending =
       this.metadataPromise ??
       presentation.indexSlideMetadata({
-        concurrency: 4,
+        concurrency: Math.max(
+          1,
+          this.memoryPolicy.backgroundConcurrency,
+        ),
+        batchSize: 8,
         priorityIndex: this.currentSlideIndex,
         isCancelled: () => this.presentation !== presentation,
+        yieldControl: () => this.yieldMetadataWork(
+          this.loadLifecycle.currentToken,
+          presentation,
+        ),
+        onWorkSlice: (durationMs) => {
+          this.performanceTracker.recordWorkSlice(durationMs);
+        },
+        onYield: () => {
+          this.performanceTracker.recordYield();
+        },
       });
     const metadata = await pending;
     if (this.presentation !== presentation) {
@@ -1452,6 +1512,47 @@ export class PptxSession extends FileView implements ReaderSession {
       this.searchIndex.set(slide);
     }
     return metadata;
+  }
+
+  private async yieldMetadataWork(
+    token: number,
+    presentation: PptxPackage,
+  ): Promise<void> {
+    const before = this.workCoordinator.snapshot().backgroundPreemptions;
+    const continued = await this.workCoordinator.yieldBackground(
+      () => yieldToWindow(this.contentEl.win),
+      () =>
+        !this.loadLifecycle.isCurrent(token) ||
+        this.presentation !== presentation,
+    );
+    const after = this.workCoordinator.snapshot().backgroundPreemptions;
+    this.performanceTracker.recordBackgroundPreemption(after - before);
+    if (!continued) {
+      throw new PptxMetadataCancelledError();
+    }
+  }
+
+  private updateMemoryPolicy(presentation: PptxPackage): ReaderMemoryPolicy {
+    const retainedResources = this.slideResources.size +
+      [...this.navigationEntries.values()].reduce(
+        (total, entry) => total + entry.resources.size,
+        0,
+      );
+    const policy = evaluateReaderMemoryPressure({
+      ...readRuntimeHeapBudget(),
+      packageBytes: presentation.zipSummary.totalUncompressedBytes,
+      packageLimitBytes: DEFAULT_PPTX_ZIP_LIMITS.maxTotalUncompressedBytes,
+      domNodes: this.rootEl?.querySelectorAll("*").length ?? 0,
+      domLimit: 3_000,
+      cacheEntries: retainedResources,
+      cacheLimit: 128,
+    });
+    this.thumbnailQueue.setConcurrency(
+      policy.backgroundConcurrency,
+      policy.backgroundConcurrency === 0,
+    );
+    this.performanceTracker.recordMemoryPressure(policy.level);
+    return policy;
   }
 
   private applyNavigationVisibility(): void {
@@ -1879,6 +1980,8 @@ export class PptxSession extends FileView implements ReaderSession {
       );
       this.navigationRenderFrameId = null;
     }
+    this.finishNavigationForeground?.();
+    this.finishNavigationForeground = null;
     if (this.metadataUiFrameId !== null) {
       this.sessionResources.cancelFrame(
         this.contentEl.win,
@@ -1904,6 +2007,23 @@ function createEmptySlideMetadata(index: number): PptxSlideMetadata {
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function yieldToWindow(targetWindow: Window): Promise<void> {
+  return new Promise((resolve) => {
+    let finished = false;
+    const finish = (): void => {
+      if (finished) {
+        return;
+      }
+      finished = true;
+      targetWindow.clearTimeout(timeout);
+      targetWindow.cancelAnimationFrame(frame);
+      resolve();
+    };
+    const timeout = targetWindow.setTimeout(finish, 50);
+    const frame = targetWindow.requestAnimationFrame(finish);
+  });
 }
 
 function logPptxRenderPerformance(

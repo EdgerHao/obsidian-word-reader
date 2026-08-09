@@ -4,6 +4,7 @@ import {
   type ReaderDiagnosticReport,
 } from "./diagnostics";
 import type { ReaderFormat } from "./readingState";
+import type { ReaderMemoryPressureLevel } from "./memoryPressure";
 
 export type PerformanceTimingName =
   | "packageLoadMs"
@@ -33,6 +34,17 @@ export interface ReaderPerformanceSnapshot {
   lifecycle: {
     cancellationPassed: boolean | null;
     cleanupPassed: boolean | null;
+  };
+  responsiveness: {
+    maximumWorkSliceMs: number;
+    longTaskCount: number;
+    yieldCount: number;
+    backgroundPreemptions: number;
+    memoryPressure: ReaderMemoryPressureLevel;
+    uninterruptiblePhase: {
+      name: "docx-preview-render";
+      durationMs: number;
+    } | null;
   };
 }
 
@@ -66,6 +78,15 @@ export class ReaderPerformanceTracker {
   private peakHeapBytes: number | null = null;
   private cancellationPassed: boolean | null = null;
   private cleanupPassed: boolean | null = null;
+  private maximumWorkSliceMs = 0;
+  private longTaskCount = 0;
+  private yieldCount = 0;
+  private backgroundPreemptions = 0;
+  private memoryPressure: ReaderMemoryPressureLevel = "normal";
+  private uninterruptiblePhase: {
+    name: "docx-preview-render";
+    durationMs: number;
+  } | null = null;
 
   constructor() {
     this.reset();
@@ -78,6 +99,12 @@ export class ReaderPerformanceTracker {
     this.scrollSamples = [];
     this.cancellationPassed = null;
     this.cleanupPassed = null;
+    this.maximumWorkSliceMs = 0;
+    this.longTaskCount = 0;
+    this.yieldCount = 0;
+    this.backgroundPreemptions = 0;
+    this.memoryPressure = "normal";
+    this.uninterruptiblePhase = null;
     const heapBytes = readRuntimeHeapBytes();
     this.heapBaselineBytes = heapBytes;
     this.peakHeapBytes = heapBytes;
@@ -102,6 +129,39 @@ export class ReaderPerformanceTracker {
 
   recordCleanup(passed: boolean): void {
     this.cleanupPassed = passed;
+  }
+
+  recordWorkSlice(durationMs: number): void {
+    const duration = normalizeDuration(durationMs);
+    this.maximumWorkSliceMs = Math.max(this.maximumWorkSliceMs, duration);
+    if (duration >= 50) {
+      this.longTaskCount += 1;
+    }
+    this.sampleHeap();
+  }
+
+  recordYield(count = 1): void {
+    this.yieldCount += normalizeCount(count);
+  }
+
+  recordBackgroundPreemption(count = 1): void {
+    this.backgroundPreemptions += normalizeCount(count);
+  }
+
+  recordMemoryPressure(level: ReaderMemoryPressureLevel): void {
+    if (
+      level === "critical" ||
+      (level === "elevated" && this.memoryPressure === "normal")
+    ) {
+      this.memoryPressure = level;
+    }
+  }
+
+  recordUninterruptibleDocxRender(durationMs: number): void {
+    this.uninterruptiblePhase = {
+      name: "docx-preview-render",
+      durationMs: normalizeDuration(durationMs),
+    };
   }
 
   sampleHeap(): void {
@@ -155,6 +215,14 @@ export class ReaderPerformanceTracker {
       lifecycle: {
         cancellationPassed: this.cancellationPassed,
         cleanupPassed: this.cleanupPassed,
+      },
+      responsiveness: {
+        maximumWorkSliceMs: round(this.maximumWorkSliceMs),
+        longTaskCount: this.longTaskCount,
+        yieldCount: this.yieldCount,
+        backgroundPreemptions: this.backgroundPreemptions,
+        memoryPressure: this.memoryPressure,
+        uninterruptiblePhase: this.uninterruptiblePhase,
       },
     };
   }

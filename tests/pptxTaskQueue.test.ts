@@ -40,3 +40,19 @@ void test("PptxTaskQueue limits concurrency and prioritizes queued work", async 
   }
   assert.ok(peak <= 2);
 });
+
+void test("PptxTaskQueue stops preload at critical pressure", async () => {
+  const queue = new PptxTaskQueue(2);
+  const started: number[] = [];
+  queue.setConcurrency(0);
+  queue.schedule(1, 0, async () => {
+    started.push(1);
+  });
+  await delay(0);
+  assert.deepEqual(started, []);
+  assert.equal(queue.queuedCount, 1);
+
+  queue.setConcurrency(1);
+  await delay(0);
+  assert.deepEqual(started, [1]);
+});

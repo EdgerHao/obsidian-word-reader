@@ -245,6 +245,33 @@ XML retention from the large-workbook path:
   generation remains unavailable to the plugin, and full parser/security tests
   protect the compatibility boundary while keeping `main.js <= 500 KiB`.
 
+## 3.5.0 Large-file and Main-thread Responsiveness Scope
+
+- Fast CI continues to run 100-page DOCX, 1,000-slide PPTX, 100,000-row sparse
+  XLSX, and 20,000-row/80,000-cell dense XLSX samples in five isolated
+  processes. It now gates maximum cooperative work slices below `50 ms`, yield
+  counts, output consistency, cancellation, and cleanup as well as the existing
+  timing, heap, DOM, cache, and artifact budgets.
+- `npm run large-files:extended` runs three isolated samples for 500-page DOCX,
+  2,000-slide PPTX, an exact 1,048,576-row sparse XLSX, and a
+  50,000-row/400,000-cell dense XLSX. It is scheduled weekly and required before
+  release, but excluded from the per-commit `npm run check` path.
+- DOCX commits visible DOM in adaptive batches. The `docx-preview` render phase
+  cannot be safely interrupted, so its duration is reported separately and DOM
+  or heap pressure reduces subsequent commit work instead of hiding that cost.
+- PPTX metadata work is ordered around the active slide and yields after bounded
+  batches. Foreground slide changes preempt metadata and thumbnail work;
+  elevated pressure lowers thumbnail concurrency and critical pressure clears
+  the queue.
+- XLSX decompression applies serialized backpressure and feeds the parser with
+  bounded XML slices. It checks cancellation before every slice, yields after
+  the work budget, and discards inactive worksheet/shared-string/image caches
+  at critical pressure.
+- Runtime performance diagnostics remain local and content-free. They add
+  maximum work slice, long-task count, yield count, background preemptions,
+  memory-pressure level, and the optional uninterruptible phase without adding
+  document text, notes, cell values, XML, heap snapshots, or vault paths.
+
 ## Manual Test Checklist
 
 Run this checklist before publishing a stable release:
@@ -254,6 +281,7 @@ Run this checklist before publishing a stable release:
   - `npm test`
   - `npm run build`
   - `npm run performance:check`
+  - `npm run large-files:extended`
   - `npm run lifecycle:check`
   - `npm run zip-reader:check`
   - `npm run dependencies:audit`

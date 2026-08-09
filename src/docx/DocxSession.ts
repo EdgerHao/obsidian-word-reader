@@ -29,6 +29,7 @@ import {
   formatWordDiagnostics,
 } from "./docxErrors";
 import { ReaderLifecycle } from "../reader/lifecycle";
+import { runCooperativeWork } from "../reader/cooperativeWork";
 import {
   type ReaderFileChange,
   type ReaderFileRevision,
@@ -63,6 +64,10 @@ import {
   type ReaderRecoveryReason,
 } from "../reader/recovery";
 import { ReaderResourceScope } from "../reader/resourceScope";
+import {
+  evaluateReaderMemoryPressure,
+  readRuntimeHeapBudget,
+} from "../reader/memoryPressure";
 import { OfficeReaderShell } from "../reader/shell";
 import type { ReaderWorkspaceRecoveryReason } from "../reader/workspaceRecovery";
 import type { ReaderCapability } from "../reader/capabilities";
@@ -82,7 +87,8 @@ const MIN_IMAGE_ZOOM = 0.1;
 const MAX_IMAGE_ZOOM = 8;
 const IMAGE_ZOOM_STEP = 1.1;
 const SEARCH_DEBOUNCE_MS = 150;
-const DOM_COMMIT_CHUNK_SIZE = 4;
+const DOM_COMMIT_MAXIMUM_BATCH_SIZE = 16;
+const DOCX_DOM_BUDGET = 120_000;
 const OUTLINE_CHUNK_SIZE = 50;
 const LONG_DOCUMENT_PAGE_THRESHOLD = 12;
 const SEARCH_HIGHLIGHT_NAME = "word-reader-search";
@@ -717,6 +723,9 @@ export class DocxSession extends FileView implements ReaderSession {
       await renderDocx(this.buffer, renderTargetEl);
       const rendererDurationMs = performance.now() - rendererStartedAt;
       this.performanceTracker.recordTiming("parseMs", rendererDurationMs);
+      this.performanceTracker.recordUninterruptibleDocxRender(
+        rendererDurationMs,
+      );
       const analysis = analyzeRenderedDocument(renderTargetEl);
       renderedBlobUrls = analysis.blobUrls;
       const { imageCount, pageCount } = analysis;
@@ -806,72 +815,74 @@ export class DocxSession extends FileView implements ReaderSession {
 
     const targetEl = this.documentEl;
     const topLevelNodes = Array.from(renderTargetEl.childNodes);
-    const totalUnits = topLevelNodes.reduce((total, node) => {
-      if (node.instanceOf(HTMLElement) && node.matches(".docx-wrapper")) {
-        return total + Math.max(node.childNodes.length, 1);
-      }
-      return total + 1;
-    }, 0);
-    let completedUnits = 0;
-
+    const units: Array<{ parent: Node; node: Node }> = [];
     for (const node of topLevelNodes) {
-      if (!this.isLoadCurrent(token) || this.documentEl !== targetEl) {
-        return;
-      }
-
       if (node.instanceOf(HTMLElement) && node.matches(".docx-wrapper")) {
         const wrapperEl = node.cloneNode(false) as HTMLElement;
-        targetEl.appendChild(wrapperEl);
-        const wrapperChildren = Array.from(node.childNodes);
-
-        if (wrapperChildren.length === 0) {
-          completedUnits += 1;
-          continue;
+        units.push({ parent: targetEl, node: wrapperEl });
+        for (const child of Array.from(node.childNodes)) {
+          units.push({ parent: wrapperEl, node: child });
         }
-
-        for (
-          let index = 0;
-          index < wrapperChildren.length;
-          index += DOM_COMMIT_CHUNK_SIZE
-        ) {
-          if (
-            !this.isLoadCurrent(token) ||
-            this.documentEl !== targetEl
-          ) {
-            return;
-          }
-
-          const fragment = activeDocument.createDocumentFragment();
-          for (const child of wrapperChildren.slice(
-            index,
-            index + DOM_COMMIT_CHUNK_SIZE,
-          )) {
-            fragment.appendChild(child);
-          }
-          wrapperEl.appendChild(fragment);
-          completedUnits += Math.min(
-            DOM_COMMIT_CHUNK_SIZE,
-            wrapperChildren.length - index,
-          );
-          this.setStatus(
-            this.text.status.preparingPreview(
-              fileName,
-              Math.round((completedUnits / totalUnits) * 100),
-            ),
-            false,
-            true,
-          );
-
-          if (index + DOM_COMMIT_CHUNK_SIZE < wrapperChildren.length) {
-            await yieldToBrowser();
-          }
-        }
-        continue;
+      } else {
+        units.push({ parent: targetEl, node });
       }
-
-      targetEl.appendChild(node);
-      completedUnits += 1;
     }
+    const pressure = evaluateReaderMemoryPressure({
+      ...readRuntimeHeapBudget(),
+      domNodes: renderTargetEl.querySelectorAll("*").length,
+      domLimit: DOCX_DOM_BUDGET,
+    }, 1);
+    this.performanceTracker.recordMemoryPressure(pressure.level);
+    const maximumBatchSize = Math.max(
+      1,
+      Math.floor(DOM_COMMIT_MAXIMUM_BATCH_SIZE * pressure.batchScale),
+    );
+    const diagnostics = await runCooperativeWork(
+      units.length,
+      (start, end) => {
+        let parent: Node | null = null;
+        let fragment: DocumentFragment | null = null;
+        const flush = (): void => {
+          if (parent && fragment) {
+            parent.appendChild(fragment);
+          }
+          parent = null;
+          fragment = null;
+        };
+        for (const unit of units.slice(start, end)) {
+          if (unit.parent !== parent) {
+            flush();
+            parent = unit.parent;
+            fragment = targetEl.ownerDocument.createDocumentFragment();
+          }
+          fragment?.appendChild(unit.node);
+        }
+        flush();
+        this.setStatus(
+          this.text.status.preparingPreview(
+            fileName,
+            Math.round((end / Math.max(units.length, 1)) * 100),
+          ),
+          false,
+          true,
+        );
+      },
+      {
+        initialBatchSize: 1,
+        maximumBatchSize,
+        timeSliceMs: 8,
+        isCancelled: () =>
+          !this.isLoadCurrent(token) || this.documentEl !== targetEl,
+        yieldControl: yieldToBrowser,
+      },
+    );
+    this.performanceTracker.recordWorkSlice(
+      diagnostics.maximumWorkSliceMs,
+    );
+    this.performanceTracker.recordYield(diagnostics.yieldCount);
+    this.performanceTracker.recordBackgroundPreemption(
+      diagnostics.preemptionCount,
+    );
   }
 
   private ensureLayout(): void {

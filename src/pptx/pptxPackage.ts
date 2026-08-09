@@ -57,9 +57,13 @@ export interface PptxSlideContext {
 
 export interface PptxMetadataIndexOptions {
   concurrency?: number;
+  batchSize?: number;
   priorityIndex?: number;
   isCancelled?: () => boolean;
   onMetadata?: (metadata: PptxSlideMetadata) => void;
+  onWorkSlice?: (durationMs: number) => void;
+  onYield?: () => void;
+  yieldControl?: () => Promise<void>;
 }
 
 export interface PptxCacheDiagnostics {
@@ -317,22 +321,36 @@ export class PptxPackage {
       this.slideCount,
       options.priorityIndex,
     );
+    const batchSize = Math.max(1, Math.floor(options.batchSize ?? 8));
+    const yieldControl = options.yieldControl ?? (async () => undefined);
     const results = new Array<PptxSlideMetadata>(this.slideCount);
     let cursor = 0;
 
     const worker = async (): Promise<void> => {
+      let batchProgress = 0;
       while (cursor < order.length) {
         if (isCancelled()) {
           throw new PptxMetadataCancelledError();
         }
         const index = order[cursor];
         cursor += 1;
+        const startedAt = performance.now();
         const metadata = await this.getSlideMetadata(index);
+        options.onWorkSlice?.(performance.now() - startedAt);
         if (isCancelled()) {
           throw new PptxMetadataCancelledError();
         }
         results[index] = metadata;
         options.onMetadata?.(metadata);
+        batchProgress += 1;
+        if (batchProgress >= batchSize && cursor < order.length) {
+          batchProgress = 0;
+          await yieldControl();
+          options.onYield?.();
+          if (isCancelled()) {
+            throw new PptxMetadataCancelledError();
+          }
+        }
       }
     };
 
@@ -439,18 +457,25 @@ function createPriorityOrder(
   slideCount: number,
   priorityIndex?: number,
 ): number[] {
-  const order = Array.from({ length: slideCount }, (_, index) => index);
   if (
     priorityIndex === undefined ||
     priorityIndex < 0 ||
     priorityIndex >= slideCount
   ) {
-    return order;
+    return Array.from({ length: slideCount }, (_, index) => index);
   }
-  return [
-    priorityIndex,
-    ...order.filter((index) => index !== priorityIndex),
-  ];
+  const order = [priorityIndex];
+  for (let distance = 1; order.length < slideCount; distance += 1) {
+    const forward = priorityIndex + distance;
+    const backward = priorityIndex - distance;
+    if (forward < slideCount) {
+      order.push(forward);
+    }
+    if (backward >= 0) {
+      order.push(backward);
+    }
+  }
+  return order;
 }
 
 export function resolvePackagePath(basePath: string, target: string): string {

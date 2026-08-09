@@ -12,17 +12,21 @@
     "p95.peakHeapMiB": 64,
     "p95.maximumDomNodes": 2000,
     "p95.cacheEntries": 1,
-    "p95.cacheAfterCleanup": 0
+    "p95.cacheAfterCleanup": 0,
+    "p95.maximumWorkSliceMs": 50
   },
   "minimums": {
     "median.contentUnits": 100,
-    "median.searchMatches": 1
+    "median.searchMatches": 1,
+    "median.yieldCount": 1
   },
   "requirements": {
     "checks.firstReadablePassed": true,
     "checks.navigationPassed": true,
     "checks.cacheWithinLimit": true,
     "checks.cancellationPassed": true,
-    "checks.cleanupPassed": true
+    "checks.cleanupPassed": true,
+    "checks.outputConsistencyPassed": true,
+    "checks.responseBudgetPassed": true
   }
 }

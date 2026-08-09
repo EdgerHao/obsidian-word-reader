@@ -13,7 +13,7 @@ export const OOXML_ZIP_HARD_LIMITS = Object.freeze<ZipSafetyLimits>({
 });
 
 export const DEFAULT_PPTX_ZIP_LIMITS = Object.freeze<ZipSafetyLimits>({
-  maxFileCount: 2_000,
+  maxFileCount: 5_000,
   maxEntryUncompressedBytes: 64 * 1024 * 1024,
   maxTotalUncompressedBytes: 256 * 1024 * 1024,
   maxCompressionRatio: 200,

@@ -18,7 +18,7 @@ void test("OOXML safety limits keep global caps and stricter PPTX defaults", () 
   });
   assert.equal(Object.isFrozen(OOXML_ZIP_HARD_LIMITS), true);
   assert.deepEqual(DEFAULT_PPTX_ZIP_LIMITS, {
-    maxFileCount: 2_000,
+    maxFileCount: 5_000,
     maxEntryUncompressedBytes: 64 * 1024 * 1024,
     maxTotalUncompressedBytes: 256 * 1024 * 1024,
     maxCompressionRatio: 200,

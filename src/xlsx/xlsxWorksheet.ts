@@ -200,6 +200,8 @@ export class XlsxWorksheetStreamParser {
   private maximumColumn = 0;
   private rowSequence = 0;
   private inputChunks = 0;
+  private yieldCount = 0;
+  private maximumWorkSliceMs = 0;
   private maximumSheetDataBufferCharacters = 0;
   private inputComplete = false;
   private built = false;
@@ -219,6 +221,19 @@ export class XlsxWorksheetStreamParser {
     this.inputChunks += 1;
     this.validator.push(chunk);
     this.consume(chunk);
+  }
+
+  recordWorkSlice(durationMs: number): void {
+    if (Number.isFinite(durationMs)) {
+      this.maximumWorkSliceMs = Math.max(
+        this.maximumWorkSliceMs,
+        Math.max(0, durationMs),
+      );
+    }
+  }
+
+  recordYield(): void {
+    this.yieldCount += 1;
   }
 
   completeInput(): string {
@@ -309,6 +324,8 @@ export class XlsxWorksheetStreamParser {
       {
         mode: "streamed",
         inputChunks: this.inputChunks,
+        yieldCount: this.yieldCount,
+        maximumWorkSliceMs: round(this.maximumWorkSliceMs),
         maximumSheetDataBufferCharacters:
           this.maximumSheetDataBufferCharacters,
         metadataCharacters: this.metadataXml.length,
@@ -426,6 +443,10 @@ export class XlsxWorksheetStreamParser {
       checkCancelled(this.options.isCancelled);
     }
   }
+}
+
+function round(value: number): number {
+  return Math.round(value * 100) / 100;
 }
 
 function parseCell(

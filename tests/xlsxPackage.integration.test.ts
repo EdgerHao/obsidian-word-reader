@@ -188,6 +188,28 @@ void test("XLSX worksheets report streamed decompression progress", async () => 
   assert.ok(progress.every((percent) => percent >= 0 && percent <= 100));
 });
 
+void test("XLSX critical-pressure cleanup keeps only the active worksheet", async () => {
+  const workbook = await XlsxPackage.load(await createRichXlsx());
+  await workbook.getWorksheet(0);
+  await workbook.getWorksheet(1);
+  await workbook.getImageBinary("xl/media/image1.png");
+  assert.deepEqual(workbook.getCacheDiagnostics(), {
+    worksheets: 2,
+    images: 1,
+    worksheetLimit: 2,
+    imageLimit: 8,
+  });
+
+  workbook.reduceMemoryPressure(1);
+  assert.deepEqual(workbook.getCacheDiagnostics(), {
+    worksheets: 1,
+    images: 0,
+    worksheetLimit: 2,
+    imageLimit: 8,
+  });
+  assert.equal((await workbook.getWorksheet(1)).name, "Hidden data");
+});
+
 void test("XLSX packages reject macros, OLE objects, and script media", async () => {
   const base = await createRichXlsx();
   const cases: Array<[string, string | Uint8Array, OoxmlPolicyError["kind"]]> = [

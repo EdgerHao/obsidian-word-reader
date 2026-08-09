@@ -331,6 +331,28 @@ export async function createLargeDenseXlsx(
   });
 }
 
+export async function createLargeSparseXlsx(
+  rowCount = 100_000,
+): Promise<ArrayBuffer> {
+  if (!Number.isInteger(rowCount) || rowCount < 1 || rowCount > 1_048_576) {
+    throw new RangeError("Sparse XLSX row count is out of range.");
+  }
+  const zip = await JSZip.loadAsync(await createRichXlsx());
+  const finalRow = String(rowCount);
+  for (const path of ["xl/workbook.xml", "xl/worksheets/sheet1.xml"]) {
+    const entry = zip.file(path);
+    if (!entry) {
+      throw new Error(`Sparse XLSX fixture is missing ${path}.`);
+    }
+    const xml = await entry.async("string");
+    zip.file(path, xml.split("100000").join(finalRow));
+  }
+  return zip.generateAsync({
+    type: "arraybuffer",
+    compression: "DEFLATE",
+  });
+}
+
 function relationships(
   entries: Array<
     [

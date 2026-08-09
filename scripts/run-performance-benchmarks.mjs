@@ -10,11 +10,14 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
 const outputDir = path.join(rootDir, ".benchmark-dist");
 const outputPath = path.join(outputDir, "performance-benchmark.cjs");
 const resultDir = path.join(rootDir, "benchmark-results");
-const resultPath = path.join(resultDir, "performance.latest.json");
-const trendPath = path.join(resultDir, "performance-trend.json");
-const summaryPath = path.join(resultDir, "performance-summary.md");
 const formats = ["docx", "pptx", "xlsx"];
-const iterations = 5;
+const profile = process.argv.includes("--extended") ? "extended" : "ci";
+const extended = profile === "extended";
+const iterations = extended ? 3 : 5;
+const resultName = extended ? "large-files" : "performance";
+const resultPath = path.join(resultDir, `${resultName}.latest.json`);
+const trendPath = path.join(resultDir, `${resultName}-trend.json`);
+const summaryPath = path.join(resultDir, `${resultName}-summary.md`);
 
 fs.rmSync(outputDir, { recursive: true, force: true });
 fs.mkdirSync(outputDir, { recursive: true });
@@ -38,10 +41,10 @@ try {
     const samples = [];
     for (let iteration = 1; iteration <= iterations; iteration += 1) {
       process.stdout.write(
-        `Running ${format.toUpperCase()} performance sample ` +
+        `Running ${format.toUpperCase()} ${profile} performance sample ` +
           `${iteration}/${iterations}...\n`,
       );
-      samples.push(runSample(format));
+      samples.push(runSample(format, profile));
     }
     formatResults[format] = aggregateSamples(samples);
   }
@@ -51,6 +54,7 @@ try {
   const result = {
     product: "Office Reader",
     schemaVersion: 1,
+    profile,
     generatedAt,
     ci: {
       commit: process.env.GITHUB_SHA ?? null,
@@ -88,10 +92,10 @@ try {
   fs.rmSync(outputDir, { recursive: true, force: true });
 }
 
-function runSample(format) {
+function runSample(format, benchmarkProfile) {
   const run = spawnSync(
     process.execPath,
-    ["--expose-gc", outputPath, format],
+    ["--expose-gc", outputPath, format, benchmarkProfile],
     {
       cwd: rootDir,
       encoding: "utf8",
@@ -205,7 +209,7 @@ function validateBudgets(result) {
     const budgetPath = path.join(
       rootDir,
       "benchmarks",
-      `${format}-budget.json`,
+      extended ? `${format}-extended-budget.json` : `${format}-budget.json`,
     );
     const budget = JSON.parse(fs.readFileSync(budgetPath, "utf8"));
     const observed = result.formats[format];
@@ -255,6 +259,7 @@ function createTrendPoint(result, failures) {
   return {
     product: result.product,
     schemaVersion: result.schemaVersion,
+    profile: result.profile,
     generatedAt: result.generatedAt,
     ci: result.ci,
     runtime: result.runtime,
@@ -274,14 +279,16 @@ function createTrendPoint(result, failures) {
 
 function createSummary(result, failures) {
   const lines = [
-    "# Office Reader performance baseline",
+    extended
+      ? "# Office Reader extended large-file baseline"
+      : "# Office Reader performance baseline",
     "",
     `Status: ${failures.length === 0 ? "passed" : "failed"}`,
     "",
     `Iterations per format: ${result.iterations} independent processes`,
     "",
-    "| Format | First readable p95 | Parse p95 | Search p95 | Navigation p95 | Scroll p95 | Peak heap p95 | Max DOM p95 |",
-    "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    "| Format | First readable p95 | Parse p95 | Search p95 | Navigation p95 | Scroll p95 | Peak heap p95 | Max DOM p95 | Max work slice p95 | Yields median |",
+    "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
   ];
   for (const format of formats) {
     const metrics = result.formats[format].p95;
@@ -289,7 +296,9 @@ function createSummary(result, failures) {
       `| ${format.toUpperCase()} | ${metrics.firstReadableMs} ms | ` +
         `${metrics.parseMs} ms | ${metrics.searchMs} ms | ` +
         `${metrics.navigationMs} ms | ${metrics.scrollFrameP95Ms} ms | ` +
-        `${metrics.peakHeapMiB} MiB | ${metrics.maximumDomNodes} |`,
+        `${metrics.peakHeapMiB} MiB | ${metrics.maximumDomNodes} | ` +
+        `${metrics.maximumWorkSliceMs} ms | ` +
+        `${result.formats[format].median.yieldCount} |`,
     );
   }
   lines.push(

@@ -11,6 +11,7 @@ import { openExternalFile } from "../commands/openExternal";
 import type WordReaderPlugin from "../main";
 import type { ReaderCapability } from "../reader/capabilities";
 import { ReaderLifecycle } from "../reader/lifecycle";
+import { ReaderWorkCoordinator } from "../reader/cooperativeWork";
 import {
   type ReaderFileChange,
   type ReaderFileRevision,
@@ -27,6 +28,11 @@ import {
   type ReaderRecoveryReason,
 } from "../reader/recovery";
 import { ReaderResourceScope } from "../reader/resourceScope";
+import {
+  evaluateReaderMemoryPressure,
+  readRuntimeHeapBudget,
+  type ReaderMemoryPolicy,
+} from "../reader/memoryPressure";
 import { OfficeReaderShell } from "../reader/shell";
 import type { ReaderWorkspaceRecoveryReason } from "../reader/workspaceRecovery";
 import {
@@ -91,6 +97,7 @@ import {
   XlsxWorksheet,
   XlsxWorksheetCancelledError,
 } from "./xlsxWorksheet";
+import { DEFAULT_XLSX_ZIP_LIMITS } from "../ooxml/packageSafety";
 
 const MIN_ZOOM = 0.25;
 const MAX_ZOOM = 4;
@@ -155,6 +162,7 @@ export class XlsxSession extends FileView implements ReaderSession {
   private completedSearchQuery = "";
   private searchTimer: number | null = null;
   private renderFrameId: number | null = null;
+  private finishGridForeground: (() => void) | null = null;
   private stateSaveTimer: number | null = null;
   private readonly loadLifecycle = new ReaderLifecycle();
   private readonly sheetLifecycle = new ReaderLifecycle();
@@ -167,6 +175,7 @@ export class XlsxSession extends FileView implements ReaderSession {
   >();
   private imageResourceGeneration = 0;
   private readonly performanceTracker = new ReaderPerformanceTracker();
+  private readonly workCoordinator = new ReaderWorkCoordinator();
   private readonly sessionResources = new ReaderResourceScope((error) => {
     console.error("Office Reader XLSX lifecycle task failed", error);
   });
@@ -369,7 +378,17 @@ export class XlsxSession extends FileView implements ReaderSession {
           !this.isFileCurrent() ||
           this.workbook !== workbook ||
           this.activeSheetIndex !== sheetIndex,
-        yieldControl: () => yieldToWindow(this.contentEl.win),
+        yieldControl: async () => {
+          const continued = await this.yieldBackgroundWork(() =>
+            !this.summaryLifecycle.isCurrent(token) ||
+            !this.isFileCurrent() ||
+            this.workbook !== workbook ||
+            this.activeSheetIndex !== sheetIndex
+          );
+          if (!continued) {
+            throw new XlsxSummaryCancelledError();
+          }
+        },
         onSheet: (sheetName, index, count) => {
           this.setStatus(
             this.text.status.creatingSummary(
@@ -709,6 +728,7 @@ export class XlsxSession extends FileView implements ReaderSession {
   private async loadWorkbook(file: TFile): Promise<void> {
     const previousToken = this.loadLifecycle.currentToken;
     this.performanceTracker.reset();
+    this.workCoordinator.resetDiagnostics();
     this.performanceLoadStartedAt = performance.now();
     this.firstReadableRecorded = false;
     this.maximumDomNodes = 0;
@@ -782,6 +802,7 @@ export class XlsxSession extends FileView implements ReaderSession {
     }
 
     const token = this.sheetLifecycle.begin();
+    const finishForeground = this.workCoordinator.beginForeground();
     this.searchLifecycle.cancel();
     this.summaryLifecycle.cancel();
     this.clearWorksheet();
@@ -793,6 +814,7 @@ export class XlsxSession extends FileView implements ReaderSession {
       true,
     );
     let lastReportedProgress = -1;
+    const memoryPolicy = this.updateMemoryPolicy(workbook);
 
     try {
       const parseStartedAt = performance.now();
@@ -801,6 +823,14 @@ export class XlsxSession extends FileView implements ReaderSession {
           !this.sheetLifecycle.isCurrent(token) ||
           !this.isFileCurrent() ||
           this.workbook !== workbook,
+        timeSliceMs: Math.max(2, 8 * memoryPolicy.batchScale),
+        yieldControl: () => yieldToWindow(this.contentEl.win),
+        onWorkSlice: (durationMs) => {
+          this.performanceTracker.recordWorkSlice(durationMs);
+        },
+        onYield: () => {
+          this.performanceTracker.recordYield();
+        },
         onProgress: (percent) => {
           const roundedPercent = Math.round(percent);
           if (
@@ -829,6 +859,10 @@ export class XlsxSession extends FileView implements ReaderSession {
         return;
       }
       this.worksheet = worksheet;
+      const completedPolicy = this.updateMemoryPolicy(workbook);
+      if (completedPolicy.level === "critical") {
+        workbook.reduceMemoryPressure(index);
+      }
       this.performanceTracker.recordTiming(
         "parseMs",
         performance.now() - parseStartedAt,
@@ -861,6 +895,8 @@ export class XlsxSession extends FileView implements ReaderSession {
       ) {
         this.showError(error);
       }
+    } finally {
+      finishForeground();
     }
   }
 
@@ -1003,26 +1039,33 @@ export class XlsxSession extends FileView implements ReaderSession {
     if (this.renderFrameId !== null) {
       return;
     }
+    this.finishGridForeground = this.workCoordinator.beginForeground();
     this.renderFrameId = this.sessionResources.requestFrame(
       this.contentEl.win,
       () => {
-      this.renderFrameId = null;
-      const startedAt = performance.now();
-      this.renderGrid();
-      const durationMs = performance.now() - startedAt;
-      this.performanceTracker.recordScrollFrame(durationMs);
-      this.maximumDomNodes = Math.max(
-        this.maximumDomNodes,
-        this.rootEl?.querySelectorAll("*").length ?? 0,
-      );
-      if (!this.firstReadableRecorded && this.worksheet) {
-        this.performanceTracker.recordTiming(
-          "firstReadableMs",
-          performance.now() -
-            (this.performanceLoadStartedAt ?? performance.now()),
-        );
-        this.firstReadableRecorded = true;
-      }
+        this.renderFrameId = null;
+        const startedAt = performance.now();
+        try {
+          this.renderGrid();
+          const durationMs = performance.now() - startedAt;
+          this.performanceTracker.recordScrollFrame(durationMs);
+          this.performanceTracker.recordWorkSlice(durationMs);
+          this.maximumDomNodes = Math.max(
+            this.maximumDomNodes,
+            this.rootEl?.querySelectorAll("*").length ?? 0,
+          );
+          if (!this.firstReadableRecorded && this.worksheet) {
+            this.performanceTracker.recordTiming(
+              "firstReadableMs",
+              performance.now() -
+                (this.performanceLoadStartedAt ?? performance.now()),
+            );
+            this.firstReadableRecorded = true;
+          }
+        } finally {
+          this.finishGridForeground?.();
+          this.finishGridForeground = null;
+        }
       },
     );
   }
@@ -1945,7 +1988,16 @@ export class XlsxSession extends FileView implements ReaderSession {
             !this.searchLifecycle.isCurrent(token) ||
             !this.isFileCurrent() ||
             this.workbook !== workbook,
-          yieldControl: () => yieldToWindow(this.contentEl.win),
+          yieldControl: async () => {
+            const continued = await this.yieldBackgroundWork(() =>
+              !this.searchLifecycle.isCurrent(token) ||
+              !this.isFileCurrent() ||
+              this.workbook !== workbook
+            );
+            if (!continued) {
+              throw new XlsxSearchCancelledError();
+            }
+          },
           onSheet: (sheetName, index, count) => {
             this.setStatus(
               this.text.status.searching(
@@ -2386,6 +2438,35 @@ export class XlsxSession extends FileView implements ReaderSession {
     return this.loadLifecycle.isCurrent(token) && this.isFileCurrent();
   }
 
+  private async yieldBackgroundWork(
+    isCancelled: () => boolean,
+  ): Promise<boolean> {
+    const before = this.workCoordinator.snapshot().backgroundPreemptions;
+    const continued = await this.workCoordinator.yieldBackground(
+      () => yieldToWindow(this.contentEl.win),
+      isCancelled,
+    );
+    const after = this.workCoordinator.snapshot().backgroundPreemptions;
+    this.performanceTracker.recordBackgroundPreemption(after - before);
+    this.performanceTracker.recordYield();
+    return continued;
+  }
+
+  private updateMemoryPolicy(workbook: XlsxPackage): ReaderMemoryPolicy {
+    const cache = workbook.getCacheDiagnostics();
+    const policy = evaluateReaderMemoryPressure({
+      ...readRuntimeHeapBudget(),
+      packageBytes: workbook.zipSummary.totalUncompressedBytes,
+      packageLimitBytes: DEFAULT_XLSX_ZIP_LIMITS.maxTotalUncompressedBytes,
+      domNodes: this.rootEl?.querySelectorAll("*").length ?? 0,
+      domLimit: 3_000,
+      cacheEntries: cache.worksheets + cache.images,
+      cacheLimit: cache.worksheetLimit + cache.imageLimit,
+    });
+    this.performanceTracker.recordMemoryPressure(policy.level);
+    return policy;
+  }
+
   private clearGridMessage(): void {
     this.gridMessageEl?.remove();
     this.gridMessageEl = null;
@@ -2484,6 +2565,8 @@ export class XlsxSession extends FileView implements ReaderSession {
       this.sessionResources.cancelFrame(this.contentEl.win, this.renderFrameId);
       this.renderFrameId = null;
     }
+    this.finishGridForeground?.();
+    this.finishGridForeground = null;
   }
 }
 
